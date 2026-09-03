@@ -1,0 +1,32 @@
+*.iml
+.gradle/
+.kotlin/
+.idea/
+local.properties
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+app/build/
+docs/device-evidence/
+
+# Local secrets and signing material
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+keystore.properties
+secrets.properties
+
+# Generated Android packages belong in GitHub Releases, not Git history
+*.apk
+*.aab
+
+# OS metadata
+.DS_Store
+Thumbs.db
