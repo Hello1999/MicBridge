@@ -83,22 +83,11 @@ class CrossGateMicController(
         authorization: OpenAuthorization,
     ): ControlResult {
         val secondaryTarget = gateTarget(target)
-        val secondaryBefore = openGate.readState(secondaryTarget)
-        if (secondaryBefore == MicAccessState.UNKNOWN) {
-            return failedOpenAfterBlockingBoth(
-                target = target,
-                priorDurationMs = 0L,
-                errorCode = "SECONDARY_GATE_UNKNOWN",
-                errorMessage = "系统麦克风安全备用门状态无法确认；拒绝 OPEN",
-            )
-        }
-        val secondaryOpen = if (secondaryBefore == MicAccessState.BLOCKED) {
-            openGate.open(secondaryTarget, authorization)
-        } else {
-            null
-        }
+        // The secondary OPEN command already performs a fresh readback under the Root lease
+        // authorization lock. A separate read immediately before it adds latency and cannot
+        // authorize the later mutation, so always use the atomic mutation+readback boundary.
+        val secondaryOpen = openGate.open(secondaryTarget, authorization)
         if (
-            secondaryOpen != null &&
             (!secondaryOpen.controlReadback || secondaryOpen.observed != MicAccessState.OPEN)
         ) {
             return failedOpenAfterBlockingBoth(
@@ -113,7 +102,7 @@ class CrossGateMicController(
         if (!primaryResult.controlReadback || primaryResult.observed != MicAccessState.OPEN) {
             return failedOpenAfterBlockingBoth(
                 target = target,
-                priorDurationMs = primaryResult.durationMs + (secondaryOpen?.durationMs ?: 0L),
+                priorDurationMs = primaryResult.durationMs + secondaryOpen.durationMs,
                 errorCode = primaryResult.errorCode ?: "PRIMARY_GATE_OPEN_FAILED",
                 errorMessage = primaryResult.errorMessage ?: "主控制层无法确认开放",
             )
@@ -121,13 +110,13 @@ class CrossGateMicController(
         val secondary = openGate.readState(secondaryTarget)
         if (secondary == MicAccessState.OPEN) {
             return primaryResult.copy(
-                durationMs = primaryResult.durationMs + (secondaryOpen?.durationMs ?: 0L),
+                durationMs = primaryResult.durationMs + secondaryOpen.durationMs,
             )
         }
 
         return failedOpenAfterBlockingBoth(
             target = target,
-            priorDurationMs = primaryResult.durationMs + (secondaryOpen?.durationMs ?: 0L),
+            priorDurationMs = primaryResult.durationMs + secondaryOpen.durationMs,
             errorCode = if (secondary == MicAccessState.BLOCKED) {
                 "SECONDARY_GATE_BLOCKED"
             } else {

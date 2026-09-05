@@ -2,21 +2,22 @@
 
 > 文档性质：测试计划与验收模板，不是测试结果。
 >
-> 当前真机状态：`NOT_RUN`。API 37 模拟器上的构建、安装、启动及应用契约测试另见设备测试矩阵，它们不改变本计划的真机状态。只有在目标 Android 与 iPhone 上实际执行、保存证据并由测试人员签字后，条目才可改为 `PASS`。模拟器、单元测试和代码审查不能替代 Root、锁屏、熄屏、Doze、Action Button 或 ChatGPT Live 声学验证。
+> 当前双机 P0 与端到端状态：`NOT_RUN`。Motorola 真机部署、两次 Root boot guard 重启检查、最终 OEM 自然开机启动，以及 iPhone 快捷指令静态结构/iCloud 同步已有本轮 `PASS` 证据，但这些子项不能替代 ChatGPT Live 声学、锁屏/熄屏、Doze、Action Button、触感或故障注入。只有对应条目在目标 Android 与 iPhone 上实际执行并保存证据后，才可分别改为 `PASS`。
 
 ## 已完成的发布基线（非真机验收）
 
-以下证据均来自同一 frozen 源码快照，产物时间为 `2026-09-03T01:46:40.0189331Z`：
+以下最终构建证据来自当前源码，APK 产物时间为 `2026-09-04T03:18:22Z`：
 
-- `clean testDebugUnitTest lintDebug assembleDebug --rerun-tasks`：`PASS`；JVM 152/152，0 failure、0 error、0 skipped。
+- `./gradlew testDebugUnitTest lintDebug assembleDebug`：`PASS`；JVM 172/172，0 failure、0 error、0 skipped。
 - Lint：0 errors、28 warnings、1 hint；warnings 为 21 `UseKtx`、3 `NewerVersionAvailable`、2 `ApplySharedPref`、1 `AndroidGradlePluginVersion`、1 `GradleDependency`，hint 为 1 `AutoboxingStateCreation`。
-- 最终 APK：`app/build/outputs/apk/debug/app-debug.apk`，30,326,289 bytes，SHA-256 `929032041DDB9EDB63983F801936E89A32D7AADF626E150FB76A5C5A9C09C6DD`。
+- 最终 APK：`app/build/outputs/apk/debug/app-debug.apk`，30,704,855 bytes，SHA-256 `403072a677facd8ef730a647b77bed255f0cde17944457b601d86911bd82ca65`；设备 `base.apk` 已核对一致。
 - `apksigner verify --verbose`：`PASS`，v2=true、Android Debug signer、1 signer；`aapt2` permissions 确认 APK 不含 `RECORD_AUDIO`；生产 APK 对 `cmd appops set` 的二进制扫描命中 0。
-- API 37 / Android 17 Pixel_10_Pro AVD 仪器测试：13/13 `PASS`。`adb install -r` 返回 `Success`；清除旧应用数据后冷启动通过；`connectedDevice` FGS 正在运行。
-- AVD 没有 `su`，所以新鲜启动明确显示“状态无法确认 / 初始化失败”，且 `8787` 未监听。这验证缺少 Root/控制读回时拒绝开放 HTTP，不是 Root 控制或真实 HTTP 成功证据；HTTP 解析、认证、路由、幂等和 socket 生命周期只由 JVM 自动测试覆盖。
-- AVD 在 `mWakefulness=Asleep` 时，`connectedDevice` FGS 仍运行且 `8787` 继续关闭。这仅证明模拟器熄屏时的 FGS/fail-closed 契约，不证明物理锁屏、熄屏或 Doze。
+- 当前源码在 API 36.1 / Android 16、Google Play ARM64 AVD 上安装成功，仪器测试 13/13 `PASS`；清除数据后冷启动的 `connectedDevice` 前台服务正常运行，AVD 无 `su`，端口 `8787` 未监听。
+- API 37 / Android 17 Pixel_10_Pro AVD 的 13/13 仪器测试、安装、冷启动和无 Root 时 fail-closed 检查来自较早源码快照，未对当前最终源码重跑。该历史结果不能作为上述最终 APK 的模拟器验证，也不能证明 Root 控制或真实 HTTP 成功。
 
-该 AVD 没有 `su`，也没有可用的 ChatGPT 包或 iPhone。Root watcher/supervisor/boot guard、目标设备安装、物理锁屏/熄屏、Doze、重启、ChatGPT Live 声学和 Action Button 均未执行，仍为 `NOT_RUN`。下方环境模板中的 APK SHA-256 应填写设备实际安装的产物；只有安装上述 frozen APK 时才能复用本节摘要。
+根目录 `SHA256SUMS.txt` 仍只认证已发布的较早 `v0.2.0` 附件（30,326,289 bytes，SHA-256 `929032041DDB9EDB63983F801936E89A32D7AADF626E150FB76A5C5A9C09C6DD`），不认证上述 Motorola 候选 APK。当前修改若形成新发布，必须使用新版本号、独立附件和匹配 checksum，不得静默替换同名 `v0.2.0` 附件。
+
+本轮已完成的目标设备子项为：最终 APK 安装到 Motorola XT2153-1（Android 13 / API 33），且设备 `base.apk` 与本地产物 SHA-256 完全一致；Root boot guard 两次真实重启均维持安全初态；最终一次 `boot_count` 230 → 231 后，users 0/10/11/900–904 全部读回 BLOCKED，Motorola OEM op525 仅放行 user 0 的 MicBridge UID 10432，`BootReceiver` 自然启动 FGS PID 4701，`8787` 监听且 `/healthz` 返回 `{"ok":true}`，未发现相关崩溃或 AVC；`MicBridge 麦克风切换` 已完成单次 POST、响应核验、1/2/3 分支的静态结构验证并通过 iCloud 同步。ChatGPT Live 声学、物理锁屏/熄屏、Doze、Action Button 实际运行、1/2/3 次触感、长期运行与故障注入仍为 `NOT_RUN`。下方环境模板仍须按正式证据填写；静态结构或开机 PASS 不得复用为未执行项目的结论。
 
 ## 1. 目标与发布闸门
 
@@ -137,7 +138,7 @@ P0 通过要求：三种屏幕状态均完成 20 个周期，零次错误状态�
 上述 20 周期是人工真机验收，UI 不会自动计数；测试人员必须先保留证据，再勾选对应声学声明。只有下列严格序列在**同一次前台服务会话**中完成，已保存校准才可标记有效：
 
 1. 点击“1. 临时开放用于测试”。此动作先清空本服务会话中旧轮的 OPEN/隔离/BLOCK 证据；只有新鲜确认 OPEN，且双精确 Alarm 与 Root watcher 都已布防，本轮才进入 OPEN 阶段。
-2. 点击“2. 仅用 Root 屏蔽（隔离校验）”。应用必须新鲜读回 `sensor_privacy=BLOCKED`、`AudioManager=OPEN`、AppOps=允许（只读），且租约/Root guard 仍健康。隔离期间合并公开状态故意为 UNKNOWN；这是校准专用 split，不是可对外声称的 BLOCKED。
+2. 点击“2. 仅用 Root 屏蔽（隔离校验）”。应用必须新鲜读回 `sensor_privacy=BLOCKED`、`AudioManager=OPEN`、AppOps 为已确认非显式否决 mode（只读且非 UNKNOWN），且租约/Root guard 仍健康。隔离期间合并公开状态故意为 UNKNOWN；这是校准专用 split，不是可对外声称的 BLOCKED。
 3. 在 split 状态尚存在时，说出本轮唯一测试语句，确认 ChatGPT 没有听到，勾选隔离确认后立即点击“3. 确认无收音并立即完整屏蔽”。点击时应用会再次读回 split 四项条件；只有它们仍匹配才接受人工确认，随后立即执行完整 BLOCK 并在确认两个门均已屏蔽后清理租约。
 4. 仅在状态为新鲜 BLOCKED、租约已清理，且本轮解锁/锁屏/熄屏 BLOCK 与原会话 OPEN 恢复证据都已人工确认时，点击“记录校准通过”。提交时会再执行一次完整 BLOCK 并检查安全边界。
 
@@ -174,13 +175,13 @@ P0 通过要求：三种屏幕状态均完成 20 个周期，零次错误状态�
 对 `audio_manager` 与 `root_sensor_privacy` 分别验证：
 
 1. 动态确认设置中的 ChatGPT 包名、当前 user/profile 与实际安装目标一致。
-2. 分别构造 UID/package mode 的 `allow`、`default`，确认它们只允许继续检查，不单独产生成功。
+2. 分别构造 UID/package mode 的 `allow`、`default`、`foreground`，确认它们只允许继续检查，不单独产生成功；其中 `foreground` 是依赖 UID 实时进程态的条件性非显式否决。
 3. 分别构造 `ignore`、`deny`、`errored`，确认 OPEN 前返回 `APPOPS_EXPLICIT_VETO` 且主控制器没有执行 OPEN。
-4. 分别构造 `foreground`、命令超时、解析不明、无 mode 或 user 不匹配，确认均返回 `APPOPS_VETO_UNKNOWN` 并拒绝 OPEN；不得把 ChatGPT 当时恰好在前台推断成 `foreground` 可放行。
+4. 分别构造命令超时、解析不明、无 mode 或 user 不匹配，确认均返回 `APPOPS_VETO_UNKNOWN` 并拒绝 OPEN。另外确认 `foreground` 仅代表 AppOps 未给出显式否决，不得从 ChatGPT 当时恰好在前台推断它当前或锁屏/熄屏时可录音。
 5. 在主控制器 OPEN 后、第二次 AppOps 读回前改变为否决或 UNKNOWN，确认经所选控制器回滚 BLOCK。
 6. 采集 Root 命令审计，确认这两个选项只执行 `cmd appops get`，绝不执行 `cmd appops set`。
 
-`allow`、`default` 只能证明“这一层没有发现 AppOps 否决”，不能替代控制器读回或 ChatGPT Live 声学校准；`foreground` 连这一结论也不能提供，必须保持 UNKNOWN。
+`allow`、`default` 与条件性 `foreground` 只能证明“这一层没有发现 AppOps 显式否决”，不能替代控制器读回或 ChatGPT Live 声学校准。特别是 `foreground` 不证明当前、锁屏或熄屏可录音；只有在同一条 Live 会话中完成解锁、锁屏、熄屏的 BLOCK/OPEN 前后对照，才能形成设备兼容性证据。
 
 ### 6.5 遗留 `root_appops` 迁移与非放宽式收尾
 
@@ -253,20 +254,20 @@ adb shell dumpsys deviceidle unforce
 
 通过条件：服务仍可接收请求；控制器能在目标屏幕状态下写入并读回；触觉反馈与新鲜读回一致。“可靠模式”默认开启，服务会取得最长 1 小时的 Partial WakeLock 并每 45 分钟释放后重新取得，长期运行时实际接近连续持有。必须分别记录可靠模式开/关（变更后重启服务）的结果、电量变化和锁持有情况，不能把它描述成仅 OPEN 期间的短锁。
 
-## 9. 30 秒开放租约与自动屏蔽
+## 9. Action Button 持续开放与校准租约
 
-每个 OPEN 应有唯一 lease ID。安全顺序必须是：先持久化 `OPENING`、预设进程外后备定时，再执行 OPEN，读回确认并提交结果。
+每个 OPEN 应有唯一 lease ID。Action Button toggle 应先持久化持续 lease、启动 Root watcher，再执行 OPEN、读回并提交；校准/诊断 `/open` 继续预设进程外后备定时。
 
-这里的 30 秒是默认配置的硬安全窗口，不是保证开放满 30 秒。当前两个发布选项都要求 Root watcher，并预留 `min(10 秒, 配置时长的一半)` 作为 BLOCK 重试预算；默认 30 秒时，持久 lease、API `auto_block_at`、进程内定时和双 Alarm 通常瞄准布防起点后约 20 秒。Root watcher 从该点开始反复 BLOCK/读回，可运行到硬 30 秒截止后的 60 秒尾窗；kernel wake lock 在硬截止后另有 90 秒超时裕量，正常退出时释放。应用确认 BLOCK 并撤销 lease 后应通过取消标记使 watcher 提前退出。
+Action Button 成功 OPEN 时 `auto_block_at` 必须为 `null`、`lease_exact_alarm_armed=false`、`lease_root_watchdog_armed=true`。5–30 秒设置只约束校准和诊断 `/open`。
 
 ### 9.1 正常路径
 
-1. 从 BLOCKED 发起 toggle，记录开始布防时刻、首次确认 OPEN 的时刻 `T0`、响应中的 `auto_block_at`，以及由配置推导出的硬截止。
-2. 不再发送请求。
-3. 记录自动 BLOCK 尝试开始时间及首次确认 BLOCKED 的时间。
+1. 从 BLOCKED 发起 toggle，确认响应为 OPEN 且没有自动截止。
+2. 等待超过校准设置的 30 秒，并持续核对控制读回仍为 OPEN。
+3. 再发送一次不同 request ID 的 toggle，确认立即 BLOCKED 并撤销 watcher。
 4. 重复 20 次。
 
-通过条件：进程内路径、RTC AlarmClock、单调 exact Alarm 与 Root watcher 的 BLOCK 尝试均不晚于返回的 `auto_block_at` 开始；默认 30 秒配置下该值通常约为布防起点加 20 秒，且绝不晚于 30 秒硬截止。另确认 watcher 在硬截止后最多 60 秒尾窗内持续执行，wake lock 超时覆盖到硬截止后 90 秒，或在应用确认 BLOCK 并撤销 lease 后提前退出并释放。报告中同时给出最大值和 p95，不能只给平均值。
+通过条件：等待期内没有 timer/Alarm 自动 BLOCK，第二次 toggle 才屏蔽；同时验证服务重启、watcher/supervisor 失效、权限撤销和受监控网络变化仍会 fail closed。校准/诊断路径另行保留原有到期测试。
 
 活动 OPEN 期间还必须采证两层持续健康监督：Root supervisor 约每 200 ms 核对 procfs/lease/watcher 轻量状态并约每秒复查 user/profile，应用进程每 250 ms 请求一次新鲜 Root 健康证明。lease 中的应用 PID/starttime、supervisor 的 PID/starttime、boot generation、watcher PID/命令行/状态任一不匹配，都应撤销 HTTP、执行全局 BLOCK/readback 并结束该 lease。`lease_root_watchdog_armed=true` 只证明初始布防，不能替代这些故障注入证据。
 

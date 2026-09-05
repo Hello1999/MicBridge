@@ -17,10 +17,13 @@ internal object RootOpenAuthorizationGuard {
 
     fun command(rawOpenCommand: String, authorization: OpenAuthorization): String {
         val requestId = RootShell.requireOpaqueId(authorization.requestId)
-        require(authorization.validUntilElapsedRealtimeMs > 0L)
+        require(
+            authorization.persistent || authorization.validUntilElapsedRealtimeMs > 0L,
+        )
         return """
             OPEN_REQUEST_ID=${RootShell.quote(requestId)}
             OPEN_VALID_UNTIL_MS=${RootShell.quote(authorization.validUntilElapsedRealtimeMs.toString())}
+            OPEN_PERSISTENT=${if (authorization.persistent) "1" else "0"}
             OPEN_LOCKED=0
             cleanup_open_guard() {
               if [ "${'$'}OPEN_LOCKED" = 1 ]; then
@@ -50,18 +53,25 @@ internal object RootOpenAuthorizationGuard {
             META_REQUEST= META_BLOCK_AT= META_DEADLINE= META_APP_PID= META_APP_START= META_GENERATION= META_ARM_BY= META_EXTRA=
             IFS='|' read -r META_REQUEST META_BLOCK_AT META_DEADLINE META_APP_PID META_APP_START META_GENERATION META_ARM_BY META_EXTRA < $LEASE_META_FILE || exit 73
             [ "${'$'}META_REQUEST" = "${'$'}OPEN_REQUEST_ID" ] || exit 73
-            [ "${'$'}META_BLOCK_AT" = "${'$'}OPEN_VALID_UNTIL_MS" ] || exit 73
+            if [ "${'$'}OPEN_PERSISTENT" = 1 ]; then
+              [ "${'$'}META_BLOCK_AT" = 0 ] || exit 73
+              [ "${'$'}META_DEADLINE" = 0 ] || exit 73
+            else
+              [ "${'$'}META_BLOCK_AT" = "${'$'}OPEN_VALID_UNTIL_MS" ] || exit 73
+            fi
             [ -z "${'$'}META_EXTRA" ] || exit 73
             case "${'$'}META_DEADLINE" in ''|*[!0-9]*) exit 73;; esac
             case "${'$'}META_APP_PID" in ''|*[!0-9]*) exit 73;; esac
             case "${'$'}META_APP_START" in ''|*[!0-9]*) exit 73;; esac
             case "${'$'}META_ARM_BY" in ''|*[!0-9]*) exit 73;; esac
             case "${'$'}META_GENERATION" in ''|*[!A-Za-z0-9._-]*) exit 73;; esac
-            [ "${'$'}META_BLOCK_AT" -lt "${'$'}META_DEADLINE" ] || exit 73
+            if [ "${'$'}OPEN_PERSISTENT" != 1 ]; then
+              [ "${'$'}META_BLOCK_AT" -lt "${'$'}META_DEADLINE" ] || exit 73
+            fi
             [ "${'$'}(cat $GENERATION_FILE 2>/dev/null)" = "${'$'}META_GENERATION" ] || exit 73
             APP_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}META_APP_PID/stat" 2>/dev/null)
-            APP_STATE=${'$'}{APP_PROC%%|*}
-            APP_START=${'$'}{APP_PROC#*|}
+            APP_STATE=${'$'}{APP_PROC%%\|*}
+            APP_START=${'$'}{APP_PROC#*\|}
             kill -0 "${'$'}META_APP_PID" 2>/dev/null || exit 73
             [ "${'$'}APP_START" = "${'$'}META_APP_START" ] || exit 73
             case "${'$'}APP_STATE" in R|S) ;; *) exit 73;; esac
@@ -74,19 +84,23 @@ internal object RootOpenAuthorizationGuard {
             tr '\000' ' ' < "/proc/${'$'}WATCH_PID/cmdline" 2>/dev/null | grep -Fq "${'$'}WATCH_SCRIPT" || exit 73
             [ "${'$'}(cat $ROOT_DIR/watch-${'$'}OPEN_REQUEST_ID.status 2>/dev/null)" = "armed-${'$'}OPEN_REQUEST_ID-${'$'}WATCH_PID" ] || exit 73
             BOOT_RECORD=${'$'}(cat $ROOT_DIR/boot-${'$'}META_GENERATION.pid 2>/dev/null)
-            BOOT_PID=${'$'}{BOOT_RECORD%%|*}
-            BOOT_START=${'$'}{BOOT_RECORD#*|}
+            BOOT_PID=${'$'}{BOOT_RECORD%%\|*}
+            BOOT_START=${'$'}{BOOT_RECORD#*\|}
             case "${'$'}BOOT_PID" in ''|*[!0-9]*) exit 73;; esac
             case "${'$'}BOOT_START" in ''|*[!0-9]*) exit 73;; esac
             kill -0 "${'$'}BOOT_PID" 2>/dev/null || exit 73
             BOOT_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}BOOT_PID/stat" 2>/dev/null)
-            case "${'$'}{BOOT_PROC%%|*}" in R|S) ;; *) exit 73;; esac
-            [ "${'$'}{BOOT_PROC#*|}" = "${'$'}BOOT_START" ] || exit 73
+            case "${'$'}{BOOT_PROC%%\|*}" in R|S) ;; *) exit 73;; esac
+            [ "${'$'}{BOOT_PROC#*\|}" = "${'$'}BOOT_START" ] || exit 73
             tr '\000' ' ' < "/proc/${'$'}BOOT_PID/cmdline" 2>/dev/null | grep -Fq "$ROOT_DIR/boot-${'$'}META_GENERATION.sh" || exit 73
-            OPEN_NOW_MS=${'$'}(awk '{printf "%.0f\\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
+            OPEN_NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
             case "${'$'}OPEN_NOW_MS" in ''|*[!0-9]*) exit 74;; esac
-            [ "${'$'}OPEN_NOW_MS" -lt "${'$'}OPEN_VALID_UNTIL_MS" ] || exit 75
-            $rawOpenCommand
+            if [ "${'$'}OPEN_PERSISTENT" != 1 ]; then
+              [ "${'$'}OPEN_NOW_MS" -lt "${'$'}OPEN_VALID_UNTIL_MS" ] || exit 75
+            fi
+            # fd 0 owns lease.lock here. Never pass that descriptor through Binder to
+            # system_server: several OEM SELinux policies reject the inherited adb_data_file.
+            $rawOpenCommand </dev/null
             OPEN_RESULT=${'$'}?
             flock -u 0
             OPEN_LOCKED=0

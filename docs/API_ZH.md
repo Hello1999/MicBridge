@@ -17,9 +17,9 @@
 | `request_id` | 修改请求中收到的 ID；iPhone 必须核对完全相等 |
 | `replayed` | 是否命中持久幂等账本且没有再次执行副作用 |
 | `original_outcome` | 重复请求首次执行的结果；自定义振动动作映射不得用它代替当前 `mic_access` |
-| `auto_block_at` | 允许维持 OPEN 的 UTC 截止时间；当前双 Alarm 与进程内 BLOCK 均瞄准此点。它早于 Root watcher 的硬截止，不等于配置时长简单相加 |
-| `lease_exact_alarm_armed` | 活动租约是否同时布防 RTC AlarmClock 与单调时钟 exact alarm；OPEN 必须为 `true` |
-| `lease_root_watchdog_armed` | 两个发布控制器的 Root watcher 是否在布防时成功启动并确认带超时的 kernel `/sys/power/wake_lock`；默认 `audio_manager` 映射为全局 sensor privacy fail-safe。OPEN 必须为 `true`。该字段本身只证明初始布防；活动 OPEN 另由常驻 Root supervisor 和应用内 250 ms 新鲜健康核验监督，也不替代双系统闹钟 |
+| `auto_block_at` | 校准/诊断 OPEN 的 UTC 截止时间；Action Button toggle 持续开放时为 `null` |
+| `lease_exact_alarm_armed` | 校准/诊断时表示双 exact Alarm 已布防；持续 toggle OPEN 时为 `false`，因为没有自动截止 |
+| `lease_root_watchdog_armed` | Root watcher 是否已启动。持续 toggle OPEN 必须为 `true`，但不取得定时 wake lock，也不按时间自动 BLOCK；仍由常驻 supervisor 和应用内健康核验监督 |
 | `error` | `null` 或固定 `code` 与脱敏 `message` |
 
 > 对修改请求，HTTP 200 只表示服务器返回了可解析的业务响应，不表示控制成功。调用方必须同时确认 `ok=true`、`verified=true`，并且响应 `request_id` 与本次发送值完全相同；随后才可依据 `mic_access="open"` 或 `"blocked"` 给出成功状态。任一字段缺失、为假、未知或请求 ID 不匹配，都必须按失败/状态无法确认处理。
@@ -58,7 +58,9 @@ Request ID 是符合上述字符集和长度的 opaque 标识，不要求 RFC UU
 
 ### `POST /v1/mic/toggle`
 
-从 Android 当前读回切换。`UNKNOWN` 时仅尝试 `BLOCKED`。
+从 Android 当前读回切换。`UNKNOWN` 时仅尝试 `BLOCKED`。由 `BLOCKED` 切到 `OPEN` 时采用持续开放，响应中 `auto_block_at=null`；正常情况下只有下一次不同 request ID 的 toggle 才切回 `BLOCKED`。服务重启、监督器失效、权限撤销或受监控网络变化仍会故障安全屏蔽。
+
+读回确认并提交成功结果后，Android 异步播放非语音状态提示：`BLOCKED → OPEN` 为短促上扬双音，`OPEN → BLOCKED` 为短促下行双音。播放期间媒体音量临时设为最接近 30% 的系统档位，结束后恢复原值；若用户在提示期间主动调节音量，则不覆盖用户的新值。提示音失败不改变已经提交的控制结果。失败、同 request ID 重放、状态未变化或从 `UNKNOWN` 收敛到安全状态时不播放。
 
 ### `POST /v1/mic/open`
 
@@ -66,7 +68,7 @@ Request ID 是符合上述字符集和长度的 opaque 标识，不要求 RFC UU
 
 配置的 `maxOpenSeconds` 是硬安全窗口，当前两个发布选项都会预留 `min(10 秒, 配置时长的一半)` 作为 Root BLOCK 重试预算。因此默认配置 30 秒时，返回的 `auto_block_at` 通常约为布防起点后 20 秒；Root watcher 从该点开始执行 BLOCK/读回，可持续到 30 秒硬截止后的 60 秒尾窗。其 kernel wake lock 超时在硬截止后另留 90 秒裕量，正常退出时主动释放。不得把 `auto_block_at` 解释成“保证开放满 30 秒”。
 
-发布版仅允许 `audio_manager` 与 `root_sensor_privacy`，两者都在 OPEN 前后只读查询目标 ChatGPT 包的 `RECORD_AUDIO` AppOps。UID override 与 package mode 合成后的有效 mode 为 `ignore`、`deny`、`errored` 时返回 `APPOPS_EXPLICIT_VETO`；`foreground` 的实际许可依赖 UID 当时的进程态，原始 mode 不能证明锁屏/后台下可录音，因此它与命令失败、解析不明或无可用 mode 一样映射为 UNKNOWN，并返回 `APPOPS_VETO_UNKNOWN`。只有有效 mode 为 `allow`、`default` 才表示这一只读层没有发现否决。该层始终只读，正常 API 路径绝不执行 `appops set`；若 OPEN 后复查出现否决/UNKNOWN，会通过所选控制器回滚 BLOCK。以上均是 HTTP 200、`ok=false` 的业务结果。
+发布版仅允许 `audio_manager` 与 `root_sensor_privacy`，两者都在 OPEN 前后只读查询目标 ChatGPT 包的 `RECORD_AUDIO` AppOps。UID override 与 package mode 合成后的有效 mode 为 `ignore`、`deny`、`errored` 时返回 `APPOPS_EXPLICIT_VETO`。`foreground` 的实际许可依赖 UID 当时的进程态，因此它是条件性非显式否决，与 `allow`、`default` 一样只表示这一只读层没有发现硬否决；它不能单独证明 ChatGPT 当前或锁屏/熄屏时可录音，这些状态必须由同一条 Live 会话的解锁、锁屏、熄屏声学校准证明。命令失败、解析不明或无可用 mode 仍映射为 UNKNOWN，并返回 `APPOPS_VETO_UNKNOWN`。该层始终只读，正常 API 路径绝不执行 `appops set`；若 OPEN 后复查出现显式否决/UNKNOWN，会通过所选控制器回滚 BLOCK。上述显式否决、UNKNOWN 或 OPEN 后回滚均以 HTTP 200、`ok=false` 的业务结果返回。
 
 旧开发版保存的 `root_appops` 选择会在加载设置时自动迁移为 `root_sensor_privacy`，不能通过 UI 或 API 再次选择。遗留 lease/开机脚本只把全局 sensor privacy 关闭到 BLOCKED；安全维护流程在全局 BLOCK 新鲜读回后读取并原样保留当前 AppOps 值，再清除旧元数据。它不会根据旧记录恢复、放宽或写入 AppOps。
 

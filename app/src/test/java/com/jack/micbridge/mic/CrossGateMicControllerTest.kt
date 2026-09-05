@@ -41,6 +41,7 @@ class CrossGateMicControllerTest {
         assertTrue(result.controlReadback)
         assertEquals(MicAccessState.OPEN, result.observed)
         assertEquals(0, primary.blockCount)
+        assertEquals(1, secondary.openCount)
     }
 
     @Test

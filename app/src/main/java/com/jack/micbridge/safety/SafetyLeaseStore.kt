@@ -10,6 +10,7 @@ data class ActiveSafetyLease(
     val deadlineElapsedRealtimeMs: Long,
     val exactAlarmArmed: Boolean,
     val rootWatchdogArmed: Boolean,
+    val persistent: Boolean = false,
 )
 
 /** Device-protected, non-secret crash recovery state for an active safety lease. */
@@ -26,6 +27,7 @@ class SafetyLeaseStore(context: Context) {
         .putLong(KEY_DEADLINE_ELAPSED, lease.deadlineElapsedRealtimeMs)
         .putBoolean(KEY_EXACT, lease.exactAlarmArmed)
         .putBoolean(KEY_ROOT, lease.rootWatchdogArmed)
+        .putBoolean(KEY_PERSISTENT, lease.persistent)
         .commit()
 
     fun load(): ActiveSafetyLease? {
@@ -35,7 +37,9 @@ class SafetyLeaseStore(context: Context) {
         val userId = preferences.getInt(KEY_USER, -1)
         val epoch = preferences.getLong(KEY_DEADLINE_EPOCH, 0L)
         val elapsed = preferences.getLong(KEY_DEADLINE_ELAPSED, 0L)
-        if (userId < 0 || epoch <= 0L || elapsed <= 0L) return null
+        val persistent = preferences.getBoolean(KEY_PERSISTENT, false)
+        if (userId < 0 || (!persistent && (epoch <= 0L || elapsed <= 0L))) return null
+        if (persistent && (epoch != 0L || elapsed != 0L)) return null
         return ActiveSafetyLease(
             requestId,
             SafetyTarget(controller, packageName, userId),
@@ -43,6 +47,7 @@ class SafetyLeaseStore(context: Context) {
             elapsed,
             preferences.getBoolean(KEY_EXACT, false),
             preferences.getBoolean(KEY_ROOT, false),
+            persistent,
         )
     }
 
@@ -58,5 +63,6 @@ class SafetyLeaseStore(context: Context) {
         private const val KEY_DEADLINE_ELAPSED = "deadline_elapsed"
         private const val KEY_EXACT = "exact"
         private const val KEY_ROOT = "root"
+        private const val KEY_PERSISTENT = "persistent"
     }
 }

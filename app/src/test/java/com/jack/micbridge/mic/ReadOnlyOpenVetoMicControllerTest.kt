@@ -43,8 +43,8 @@ class ReadOnlyOpenVetoMicControllerTest {
     }
 
     @Test
-    fun `only static allow and default are non-veto modes`() {
-        listOf("allow", "default").forEach { mode ->
+    fun `allow default and conditional foreground are non-veto modes`() {
+        listOf("allow", "default", "foreground").forEach { mode ->
             assertEquals(
                 MicAccessState.OPEN,
                 AppOpsReadOnlyOpenVeto.modesToVetoState(
@@ -55,12 +55,6 @@ class ReadOnlyOpenVetoMicControllerTest {
         assertEquals(
             MicAccessState.UNKNOWN,
             AppOpsReadOnlyOpenVeto.modesToVetoState(null),
-        )
-        assertEquals(
-            MicAccessState.UNKNOWN,
-            AppOpsReadOnlyOpenVeto.modesToVetoState(
-                AppOpsModeReader.Companion.ParsedModes("foreground", null),
-            ),
         )
     }
 
@@ -91,7 +85,7 @@ class ReadOnlyOpenVetoMicControllerTest {
             ),
         )
         assertEquals(
-            MicAccessState.UNKNOWN,
+            MicAccessState.OPEN,
             AppOpsReadOnlyOpenVeto.modesToVetoState(
                 AppOpsModeReader.Companion.ParsedModes("ignore", "foreground"),
             ),

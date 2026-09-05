@@ -9,10 +9,13 @@ data class LeaseArmResult(
     val exactAlarmArmed: Boolean,
     val rootWatchdogArmed: Boolean,
     val error: String? = null,
+    val persistent: Boolean = false,
 )
 
 interface LeaseSafety {
     suspend fun arm(requestId: String, durationSeconds: Int, target: SafetyTarget): LeaseArmResult
+    suspend fun armPersistent(requestId: String, target: SafetyTarget): LeaseArmResult =
+        arm(requestId, 30, target)
     suspend fun cancel()
     suspend fun loadActiveLease(): ActiveSafetyLease? = null
     suspend fun verifyActiveGuard(requestId: String): Boolean = true

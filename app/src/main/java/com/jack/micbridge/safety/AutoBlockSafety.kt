@@ -24,21 +24,33 @@ class AutoBlockSafety(
 ) : LeaseSafety {
     private val alarmManager = context.getSystemService(AlarmManager::class.java)
     private val leaseStore = SafetyLeaseStore(context)
+    @Volatile
+    private var preparedRootBootGuard: RootBootGuardTarget? = null
+    @Volatile
+    private var rootWorkspaceClaimed = false
 
     override suspend fun arm(
         requestId: String,
         durationSeconds: Int,
         target: SafetyTarget,
     ): LeaseArmResult = mutationGate.withLock {
-        armWhileLocked(requestId, durationSeconds, target)
+        armWhileLocked(requestId, durationSeconds, target, persistent = false)
+    }
+
+    override suspend fun armPersistent(
+        requestId: String,
+        target: SafetyTarget,
+    ): LeaseArmResult = mutationGate.withLock {
+        armWhileLocked(requestId, durationSeconds = null, target, persistent = true)
     }
 
     private suspend fun armWhileLocked(
         requestId: String,
-        durationSeconds: Int,
+        durationSeconds: Int?,
         target: SafetyTarget,
+        persistent: Boolean,
     ): LeaseArmResult {
-        if (!ownsRootWorkspace()) {
+        if (!rootWorkspaceClaimed && !ownsRootWorkspace()) {
             return LeaseArmResult(
                 false,
                 0L,
@@ -69,18 +81,28 @@ class AutoBlockSafety(
         }
         val safeId = runCatching { RootShell.requireOpaqueId(requestId) }.getOrNull()
             ?: return LeaseArmResult(false, 0L, 0L, false, false, "request_id 不适合安全租约")
-        if (durationSeconds !in 1..SettingsRepository.MAX_OPEN_SECONDS) {
+        if (!persistent && (durationSeconds == null || durationSeconds !in 1..SettingsRepository.MAX_OPEN_SECONDS)) {
             return LeaseArmResult(false, 0L, 0L, false, false, "安全租约时长超出允许范围")
         }
-        val hardDeadline = System.currentTimeMillis() + durationSeconds * 1_000L
-        val hardDeadlineElapsed =
-            android.os.SystemClock.elapsedRealtime() + durationSeconds * 1_000L
+        val timedDurationSeconds = durationSeconds ?: 0
+        val hardDeadline = if (persistent) {
+            0L
+        } else {
+            System.currentTimeMillis() + timedDurationSeconds * 1_000L
+        }
+        val hardDeadlineElapsed = if (persistent) {
+            0L
+        } else {
+            android.os.SystemClock.elapsedRealtime() + timedDurationSeconds * 1_000L
+        }
         val controllerId = target.controllerId
         val targetPackage = target.targetPackage
         val userId = target.userId
         val rootRequired = controllerId in ROOT_WATCHDOG_CONTROLLERS
-        val retryBudgetMs = if (rootRequired) {
-            minOf(ROOT_BLOCK_RETRY_BUDGET_MS, durationSeconds * 1_000L / 2L)
+        val retryBudgetMs = if (persistent) {
+            0L
+        } else if (rootRequired) {
+            minOf(ROOT_BLOCK_RETRY_BUDGET_MS, timedDurationSeconds * 1_000L / 2L)
         } else {
             0L
         }
@@ -95,6 +117,7 @@ class AutoBlockSafety(
             openValidUntilElapsed,
             exactAlarmArmed = false,
             rootWatchdogArmed = false,
+            persistent = persistent,
         )
         // Commit the immutable block target before arming anything or allowing OPEN. If the
         // process dies at any later instruction, startup can still block this exact target.
@@ -108,20 +131,27 @@ class AutoBlockSafety(
                 "无法持久化安全租约目标",
             )
         }
-        val exact = armExactAlarm(
-            safeId,
-            openValidUntil,
-            openValidUntilElapsed,
-            controllerId,
-            targetPackage,
-            userId,
-        )
-        val root = if (exact && rootRequired) {
+        val exact = if (persistent) {
+            alarmManager.cancel(alarmIntent(requestCode = WALL_ALARM_REQUEST_CODE))
+            alarmManager.cancel(alarmIntent(requestCode = ELAPSED_ALARM_REQUEST_CODE))
+            false
+        } else {
+            armExactAlarm(
+                safeId,
+                openValidUntil,
+                openValidUntilElapsed,
+                controllerId,
+                targetPackage,
+                userId,
+            )
+        }
+        val root = if ((persistent || exact) && rootRequired) {
             armRootWatchdog(
                 safeId,
                 hardDeadlineElapsed,
                 openValidUntilElapsed,
                 target,
+                persistent,
             )
         } else {
             false
@@ -129,11 +159,16 @@ class AutoBlockSafety(
         // A shell `sleep` is useful process-death defence but is not a wake-up primitive:
         // deep sleep can delay it. The OS exact ELAPSED_REALTIME_WAKEUP alarm is therefore
         // mandatory; the root watcher is only a second, independent layer.
-        val guardsArmed = exact && (!rootRequired || root)
+        val guardsArmed = if (persistent) {
+            rootRequired && root
+        } else {
+            exact && (!rootRequired || root)
+        }
         val durable = leaseStore.save(
             provisional.copy(
                 exactAlarmArmed = exact,
                 rootWatchdogArmed = root,
+                persistent = persistent,
             ),
         )
         val armed = guardsArmed && durable
@@ -143,9 +178,11 @@ class AutoBlockSafety(
             deadlineElapsedRealtimeMs = openValidUntilElapsed,
             exactAlarmArmed = exact,
             rootWatchdogArmed = root,
+            persistent = persistent,
             error = when {
                 armed -> null
                 !durable -> "安全租约布防结果无法持久化；已拒绝开放"
+                persistent && !root -> "持续开放 Root 监督器未布防；已拒绝开放"
                 !exact -> "双系统精确安全闹钟未完整布防；已拒绝开放"
                 rootRequired && !root -> "独立 Root 租约看门狗未布防；已拒绝开放"
                 else -> "安全租约未完整布防；已拒绝开放"
@@ -206,14 +243,20 @@ class AutoBlockSafety(
                 case "${'$'}META_APP_START" in ''|*[!0-9]*) exit 1;; esac
                 case "${'$'}META_ARM_BY" in ''|*[!0-9]*) exit 1;; esac
                 case "${'$'}META_GENERATION" in ''|*[!A-Za-z0-9._-]*) exit 1;; esac
-                test "${'$'}META_BLOCK_AT" -lt "${'$'}META_DEADLINE"
+                if [ "${'$'}META_BLOCK_AT" = 0 ]; then
+                  test "${'$'}META_DEADLINE" = 0
+                else
+                  test "${'$'}META_BLOCK_AT" -lt "${'$'}META_DEADLINE"
+                fi
                 test "${'$'}(cat $ROOT_BOOT_GENERATION_FILE 2>/dev/null)" = "${'$'}META_GENERATION"
-                NOW_MS=${'$'}(awk '{printf "%.0f\\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
+                NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
                 case "${'$'}NOW_MS" in ''|*[!0-9]*) exit 1;; esac
-                test "${'$'}NOW_MS" -lt "${'$'}META_BLOCK_AT"
+                if [ "${'$'}META_BLOCK_AT" != 0 ]; then
+                  test "${'$'}NOW_MS" -lt "${'$'}META_BLOCK_AT"
+                fi
                 APP_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}META_APP_PID/stat" 2>/dev/null)
-                APP_STATE=${'$'}{APP_PROC%%|*}
-                APP_START=${'$'}{APP_PROC#*|}
+                APP_STATE=${'$'}{APP_PROC%%\|*}
+                APP_START=${'$'}{APP_PROC#*\|}
                 test "${'$'}APP_START" = "${'$'}META_APP_START"
                 case "${'$'}APP_STATE" in R|S) ;; *) exit 1;; esac
                 WATCH_SCRIPT=$ROOT_DIR/watch-${'$'}CURRENT_REQUEST.sh
@@ -225,14 +268,14 @@ class AutoBlockSafety(
                 tr '\000' ' ' < "/proc/${'$'}WATCH_PID/cmdline" | grep -Fq "${'$'}WATCH_SCRIPT"
                 test "${'$'}(cat $ROOT_DIR/watch-${'$'}CURRENT_REQUEST.status 2>/dev/null)" = "armed-${'$'}CURRENT_REQUEST-${'$'}WATCH_PID"
                 BOOT_RECORD=${'$'}(cat $ROOT_DIR/boot-${'$'}META_GENERATION.pid 2>/dev/null)
-                BOOT_PID=${'$'}{BOOT_RECORD%%|*}
-                BOOT_START=${'$'}{BOOT_RECORD#*|}
+                BOOT_PID=${'$'}{BOOT_RECORD%%\|*}
+                BOOT_START=${'$'}{BOOT_RECORD#*\|}
                 case "${'$'}BOOT_PID" in ''|*[!0-9]*) exit 1;; esac
                 case "${'$'}BOOT_START" in ''|*[!0-9]*) exit 1;; esac
                 kill -0 "${'$'}BOOT_PID" 2>/dev/null
                 BOOT_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}BOOT_PID/stat" 2>/dev/null)
-                case "${'$'}{BOOT_PROC%%|*}" in R|S) ;; *) exit 1;; esac
-                test "${'$'}{BOOT_PROC#*|}" = "${'$'}BOOT_START"
+                case "${'$'}{BOOT_PROC%%\|*}" in R|S) ;; *) exit 1;; esac
+                test "${'$'}{BOOT_PROC#*\|}" = "${'$'}BOOT_START"
                 tr '\000' ' ' < "/proc/${'$'}BOOT_PID/cmdline" | grep -Fq "$ROOT_DIR/boot-${'$'}META_GENERATION.sh"
                 flock -u 0
             """.trimIndent(),
@@ -298,6 +341,7 @@ class AutoBlockSafety(
             """.trimIndent(),
             timeoutMs = ROOT_DEPLOY_TIMEOUT_MS,
         )
+        rootWorkspaceClaimed = result.succeeded
         return result.succeeded
     }
 
@@ -349,6 +393,10 @@ class AutoBlockSafety(
         targetPackage: String,
         userId: Int,
     ): Boolean {
+        val preparedTarget = RootBootGuardTarget(controllerId, targetPackage, userId)
+        // Once a deployment attempt starts, the prior in-memory proof is no longer usable: the
+        // command may advance the generation before failing. A later OPEN must redeploy.
+        preparedRootBootGuard = null
         val generation = newRootGeneration()
         val versionPath = "$ROOT_DIR/boot-$generation.sh"
         val bootScript = RootFailSafeScripts.bootGuard(
@@ -437,14 +485,14 @@ class AutoBlockSafety(
               case "${'$'}STATUS" in
                 blocked-${generation}|user-context-blocked-${generation}|lease-watcher-restarted-${generation})
                   SUPERVISOR_RECORD=${'$'}(cat ${RootShell.quote("$ROOT_DIR/boot-$generation.pid")} 2>/dev/null)
-                  SUPERVISOR_PID=${'$'}{SUPERVISOR_RECORD%%|*}
-                  SUPERVISOR_START=${'$'}{SUPERVISOR_RECORD#*|}
+                  SUPERVISOR_PID=${'$'}{SUPERVISOR_RECORD%%\|*}
+                  SUPERVISOR_START=${'$'}{SUPERVISOR_RECORD#*\|}
                   case "${'$'}SUPERVISOR_PID" in ''|*[!0-9]*) exit 1;; esac
                   case "${'$'}SUPERVISOR_START" in ''|*[!0-9]*) exit 1;; esac
                   kill -0 "${'$'}SUPERVISOR_PID" 2>/dev/null
                   SUPERVISOR_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}SUPERVISOR_PID/stat" 2>/dev/null)
-                  case "${'$'}{SUPERVISOR_PROC%%|*}" in R|S) ;; *) exit 1;; esac
-                  test "${'$'}{SUPERVISOR_PROC#*|}" = "${'$'}SUPERVISOR_START"
+                  case "${'$'}{SUPERVISOR_PROC%%\|*}" in R|S) ;; *) exit 1;; esac
+                  test "${'$'}{SUPERVISOR_PROC#*\|}" = "${'$'}SUPERVISOR_START"
                   tr '\000' ' ' < "/proc/${'$'}SUPERVISOR_PID/cmdline" | grep -Fq ${RootShell.quote(versionPath)}
                   exit 0
                   ;;
@@ -456,11 +504,16 @@ class AutoBlockSafety(
             exit 1
         """.trimIndent()
         val result = rootShell.execute(command, timeoutMs = ROOT_DEPLOY_TIMEOUT_MS)
-        if (result.succeeded) settings.rootBootGuardInstalled = true
+        if (result.succeeded) {
+            settings.rootBootGuardInstalled = true
+            preparedRootBootGuard = preparedTarget
+        }
         return result.succeeded
     }
 
     suspend fun removeRootBootGuard(): Boolean {
+        preparedRootBootGuard = null
+        rootWorkspaceClaimed = false
         val tombstone = "removed-${newRootGeneration()}"
         val result = rootShell.execute(
             """
@@ -555,6 +608,7 @@ class AutoBlockSafety(
         hardDeadlineElapsedRealtimeMs: Long,
         openValidUntilElapsedRealtimeMs: Long,
         target: SafetyTarget,
+        persistent: Boolean,
     ): Boolean = withContext(Dispatchers.IO) {
         val controllerId = if (
             target.controllerId == SettingsRepository.CONTROLLER_AUDIO_MANAGER
@@ -577,8 +631,15 @@ class AutoBlockSafety(
 
         // Reboot while OPEN must also fail closed. A Root lease is therefore not considered
         // armed unless the persistent service.d blocker for this exact controller target was
-        // deployed successfully as well.
-        if (!deployRootBootGuard(controllerId, targetPackage, target.userId)) {
+        // prepared by this service process. Install/startup prepares it once; repeating the full
+        // generation deployment on every button press adds seconds without adding an independent
+        // guard. RootOpenAuthorizationGuard still freshly proves the exact supervisor PID,
+        // generation and process start time at the last instruction boundary before OPEN.
+        val requiredGuard = RootBootGuardTarget(controllerId, targetPackage, target.userId)
+        if (
+            preparedRootBootGuard != requiredGuard &&
+            !deployRootBootGuard(controllerId, targetPackage, target.userId)
+        ) {
             return@withContext false
         }
 
@@ -595,6 +656,7 @@ class AutoBlockSafety(
             watcherPath = watcherPath,
             watcherStatusPath = watcherStatusPath,
             wakeTag = wakeTag,
+            persistent = persistent,
         ) ?: return@withContext false
         val encoded = Base64.encodeToString(
             watcher.toByteArray(Charsets.UTF_8),
@@ -614,6 +676,7 @@ class AutoBlockSafety(
             $prerequisite
             exec 0>>$ROOT_LEASE_LOCK_FILE
             flock -x 0
+            test "${'$'}(cat $ROOT_OWNER_FILE 2>/dev/null)" = ${RootShell.quote(android.os.Process.myUid().toString())}
             SETUP_LOCKED=1
             LEASE_TMP=${RootShell.quote("$LEASE_FILE.$requestId.tmp")}
             META_TMP=${RootShell.quote("$LEASE_META_FILE.$requestId.tmp")}
@@ -631,13 +694,13 @@ class AutoBlockSafety(
             trap 'exit 1' HUP INT TERM
             APP_PID=${RootShell.quote(android.os.Process.myPid().toString())}
             APP_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}APP_PID/stat" 2>/dev/null)
-            APP_STATE=${'$'}{APP_PROC%%|*}
-            APP_START=${'$'}{APP_PROC#*|}
+            APP_STATE=${'$'}{APP_PROC%%\|*}
+            APP_START=${'$'}{APP_PROC#*\|}
             case "${'$'}APP_STATE" in R|S) ;; *) exit 1;; esac
             case "${'$'}APP_START" in ''|*[!0-9]*) exit 1;; esac
             GENERATION=${'$'}(cat $ROOT_BOOT_GENERATION_FILE 2>/dev/null)
             case "${'$'}GENERATION" in g-[0-9a-f][0-9a-f]*) ;; *) exit 1;; esac
-            SETUP_NOW_MS=${'$'}(awk '{printf "%.0f\\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
+            SETUP_NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
             case "${'$'}SETUP_NOW_MS" in ''|*[!0-9]*) exit 1;; esac
             ARM_BY_MS=${'$'}((SETUP_NOW_MS + $ROOT_ARM_GRACE_MS))
             printf %s ${RootShell.quote(encoded)} | base64 -d > "${'$'}WATCH_TMP"
@@ -672,15 +735,15 @@ class AutoBlockSafety(
                 if ! kill -0 "${'$'}WATCH_PID" 2>/dev/null; then
                   exit 1
                 fi
-                NOW_MS=${'$'}(awk '{printf "%.0f\\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
+                NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
                 case "${'$'}NOW_MS" in ''|*[!0-9]*) exit 1;; esac
-                if [ "${'$'}NOW_MS" -ge ${RootShell.quote(openValidUntilElapsedRealtimeMs.toString())} ]; then
+                if [ ${if (persistent) "1" else "0"} != 1 ] && [ "${'$'}NOW_MS" -ge ${RootShell.quote(openValidUntilElapsedRealtimeMs.toString())} ]; then
                   exit 1
                 fi
                 sleep 0.05
-                NOW_MS=${'$'}(awk '{printf "%.0f\\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
+                NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
                 case "${'$'}NOW_MS" in ''|*[!0-9]*) exit 1;; esac
-                if [ "${'$'}NOW_MS" -ge ${RootShell.quote(openValidUntilElapsedRealtimeMs.toString())} ]; then
+                if [ ${if (persistent) "1" else "0"} != 1 ] && [ "${'$'}NOW_MS" -ge ${RootShell.quote(openValidUntilElapsedRealtimeMs.toString())} ]; then
                   exit 1
                 fi
                 kill -0 "${'$'}WATCH_PID" 2>/dev/null
@@ -810,6 +873,12 @@ class AutoBlockSafety(
             SettingsRepository.CONTROLLER_SENSOR_PRIVACY,
         )
     }
+
+    private data class RootBootGuardTarget(
+        val controllerId: String,
+        val targetPackage: String,
+        val userId: Int,
+    )
 }
 
 internal fun directBootTargetMatches(
@@ -945,10 +1014,13 @@ internal object RootFailSafeScripts {
         GENERATION_FILE=$GENERATION_FILE
         SUPERVISOR_LOCK="${'$'}MB_DIR/supervisor.lock"
         command -v flock >/dev/null 2>&1 || exit 1
-        exec 9>>"${'$'}SUPERVISOR_LOCK" || exit 1
+        # Some Android shells mark descriptors above stderr close-on-exec, so `flock 9`
+        # loses its descriptor when the external flock binary starts. Descriptor 0 is already
+        # used by the lease protocol and is preserved across exec on the supported Root shells.
+        exec 0>>"${'$'}SUPERVISOR_LOCK" || exit 1
         # Magisk/KernelSU may invoke the launcher again after an in-app refresh. Exactly one
         # root-owned parent supervises the current immutable generation at a time.
-        flock -n -x 9 || exit 0
+        flock -n -x 0 || exit 0
         while [ -f "${'$'}GENERATION_FILE" ]; do
           GENERATION=${'$'}(cat "${'$'}GENERATION_FILE" 2>/dev/null) || break
           case "${'$'}GENERATION" in
@@ -959,7 +1031,7 @@ internal object RootFailSafeScripts {
           sh "${'$'}VERSION_SCRIPT"
           sleep $ROOT_SUPERVISOR_RESTART_SECONDS
         done
-        flock -u 9
+        flock -u 0
     """.trimIndent() + "\n"
 
     fun bootGuard(
@@ -1016,7 +1088,7 @@ internal object RootFailSafeScripts {
                 rm -f "${'$'}STATUS_TMP"
               fi
               PID_RECORD=${'$'}(cat "${'$'}PID_FILE" 2>/dev/null)
-              if [ "${'$'}{PID_RECORD%%|*}" = "${'$'}${'$'}" ]; then
+              if [ "${'$'}{PID_RECORD%%\|*}" = "${'$'}${'$'}" ]; then
                 rm -f "${'$'}PID_FILE"
               fi
             }
@@ -1042,7 +1114,7 @@ internal object RootFailSafeScripts {
               exit 1
             fi
             exec 0>>"${'$'}LOCK_FILE" || exit 1
-            BOOT_NOW_MS=${'$'}(awk '{printf "%.0f\\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
+            BOOT_NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
             BOOT_CLOCK_FAILED=0
             BOOT_CLOCK_FAILURE_TRY=0
             INITIAL_BLOCKED=0
@@ -1061,7 +1133,7 @@ internal object RootFailSafeScripts {
             esac
             while :; do
               if [ "${'$'}BOOT_CLOCK_FAILED" = 0 ]; then
-                BOOT_NOW_MS=${'$'}(awk '{printf "%.0f\\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
+                BOOT_NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
                 case "${'$'}BOOT_NOW_MS" in
                   ''|*[!0-9]*)
                     BOOT_CLOCK_FAILED=1
@@ -1204,18 +1276,25 @@ internal object RootFailSafeScripts {
                     case "${'$'}META_APP_START" in ''|*[!0-9]*) CLOSE_REASON=meta-app-start;; esac
                     case "${'$'}META_ARM_BY" in ''|*[!0-9]*) CLOSE_REASON=meta-arm-by;; esac
                   fi
-                  if [ -z "${'$'}CLOSE_REASON" ] && [ "${'$'}META_BLOCK_AT" -ge "${'$'}META_DEADLINE" ]; then
+                  META_PERSISTENT=0
+                  if [ -z "${'$'}CLOSE_REASON" ] && [ "${'$'}META_BLOCK_AT" = 0 ]; then
+                    if [ "${'$'}META_DEADLINE" = 0 ]; then
+                      META_PERSISTENT=1
+                    else
+                      CLOSE_REASON=meta-window
+                    fi
+                  elif [ -z "${'$'}CLOSE_REASON" ] && [ "${'$'}META_BLOCK_AT" -ge "${'$'}META_DEADLINE" ]; then
                     CLOSE_REASON=meta-window
                   fi
-                  NOW_MS=${'$'}(awk '{printf "%.0f\\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
+                  NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
                   case "${'$'}NOW_MS" in ''|*[!0-9]*) CLOSE_REASON=deadline-clock;; esac
-                  if [ -z "${'$'}CLOSE_REASON" ] && [ "${'$'}NOW_MS" -ge "${'$'}META_BLOCK_AT" ]; then
+                  if [ -z "${'$'}CLOSE_REASON" ] && [ "${'$'}META_PERSISTENT" != 1 ] && [ "${'$'}NOW_MS" -ge "${'$'}META_BLOCK_AT" ]; then
                     CLOSE_REASON=deadline
                   fi
                   if [ -z "${'$'}CLOSE_REASON" ]; then
                     APP_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}META_APP_PID/stat" 2>/dev/null)
-                    APP_STATE=${'$'}{APP_PROC%%|*}
-                    APP_START=${'$'}{APP_PROC#*|}
+                    APP_STATE=${'$'}{APP_PROC%%\|*}
+                    APP_START=${'$'}{APP_PROC#*\|}
                     kill -0 "${'$'}META_APP_PID" 2>/dev/null || CLOSE_REASON=app-dead
                     [ "${'$'}APP_START" = "${'$'}META_APP_START" ] || CLOSE_REASON=app-replaced
                     case "${'$'}APP_STATE" in R|S) ;; *) CLOSE_REASON=app-unhealthy;; esac
@@ -1278,8 +1357,17 @@ internal object RootFailSafeScripts {
         watcherPath: String,
         watcherStatusPath: String,
         wakeTag: String,
+        persistent: Boolean = false,
     ): String? {
         val blockAttempt = blockAttempt(controllerId) ?: return null
+        // Before OPEN, only the frozen foreground user can be mutated. Prove that exact native
+        // block path quickly; terminal enforcement below retains the full all-user attempt.
+        val preflightBlockAttempt = when (controllerId) {
+            SettingsRepository.CONTROLLER_APP_OPS,
+            SettingsRepository.CONTROLLER_SENSOR_PRIVACY ->
+                SensorPrivacyRootProtocol.blockTargetUserAttempt(COMMAND_TIMEOUT)
+            else -> return null
+        }
         val runtimePrerequisites = runtimePrerequisiteCondition(controllerId) ?: return null
         val watcherPidPath = watcherPath.removeSuffix(".sh") + ".pid"
         return """
@@ -1287,6 +1375,7 @@ internal object RootFailSafeScripts {
             REQUEST_ID=${RootShell.quote(requestId)}
             DEADLINE_MS=${RootShell.quote(deadlineElapsedRealtimeMs.toString())}
             BLOCK_AT_MS=${RootShell.quote(blockAtElapsedRealtimeMs.toString())}
+            PERSISTENT=${if (persistent) "1" else "0"}
             WAKE_TAG=${RootShell.quote(wakeTag)}
             STATUS_FILE=${RootShell.quote(watcherStatusPath)}
             WATCHER_PATH=${RootShell.quote(watcherPath)}
@@ -1300,7 +1389,7 @@ internal object RootFailSafeScripts {
             STATUS_TMP=
             LEASE_TMP=
             boottime_ms() {
-              awk '{printf "%.0f\\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null
+              awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null
             }
             write_status() {
               STATUS_TMP="${'$'}STATUS_FILE.tmp.${'$'}${'$'}"
@@ -1382,7 +1471,7 @@ internal object RootFailSafeScripts {
             fi
             LAST=unverified
             BLOCK_VERIFIED=0
-            $blockAttempt
+            $preflightBlockAttempt
             if [ "${'$'}BLOCK_VERIFIED" != 1 ]; then
               write_status "preflight-block-unverified-${'$'}LAST-${'$'}REQUEST_ID"
               release_lock
@@ -1397,7 +1486,24 @@ internal object RootFailSafeScripts {
                 ;;
             esac
             CLOCK_FAILED=0
-            if [ "${'$'}NOW_MS" -lt "${'$'}BLOCK_AT_MS" ]; then
+            if [ "${'$'}PERSISTENT" = 1 ]; then
+              write_status "armed-${'$'}REQUEST_ID-${'$'}SELF_PID"
+              release_lock
+              while :; do
+                if ! acquire_lock; then
+                  write_status "lock-contended-${'$'}REQUEST_ID"
+                  sleep 0.05
+                  continue
+                fi
+                CURRENT=${'$'}(cat "${'$'}LEASE_FILE" 2>/dev/null)
+                if [ "${'$'}CURRENT" != "${'$'}REQUEST_ID" ]; then
+                  release_lock
+                  exit 0
+                fi
+                release_lock
+                sleep 0.20
+              done
+            elif [ "${'$'}NOW_MS" -lt "${'$'}BLOCK_AT_MS" ]; then
               if [ ! -w /sys/power/wake_lock ] || [ ! -w /sys/power/wake_unlock ]; then
                 write_status "wake-lock-unavailable-${'$'}REQUEST_ID"
                 release_lock
@@ -1405,8 +1511,11 @@ internal object RootFailSafeScripts {
               fi
               REMAINING_MS=${'$'}((DEADLINE_MS - NOW_MS))
               WAKE_TIMEOUT_MS=${'$'}((REMAINING_MS + $ROOT_WATCHDOG_TAIL_MS))
-              WAKE_TIMEOUT_NANOS=${'$'}(awk -v ms="${'$'}WAKE_TIMEOUT_MS" 'BEGIN {printf "%.0f\\n", ms * 1000000}')
-              if ! printf '%s %s' "${'$'}WAKE_TAG" "${'$'}WAKE_TIMEOUT_NANOS" > /sys/power/wake_lock; then
+              WAKE_TIMEOUT_NANOS=${'$'}(awk -v ms="${'$'}WAKE_TIMEOUT_MS" 'BEGIN {printf "%.0f\n", ms * 1000000}')
+              # Some Android shells issue one write per printf conversion. Sysfs requires the
+              # tag and timeout to arrive in one write, so build a single payload first.
+              WAKE_PAYLOAD="${'$'}WAKE_TAG ${'$'}WAKE_TIMEOUT_NANOS"
+              if ! printf %s "${'$'}WAKE_PAYLOAD" > /sys/power/wake_lock; then
                 write_status "wake-lock-failed-${'$'}REQUEST_ID"
                 release_lock
                 exit 1

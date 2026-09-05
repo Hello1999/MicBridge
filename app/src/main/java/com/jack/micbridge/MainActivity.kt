@@ -304,11 +304,11 @@ private fun MicBridgeScreen() {
                 ) { Text("保存目标包") }
             }
 
-            Section("30 秒开放租约") {
+            Section("校准临时开放时限") {
                 OutlinedTextField(
                     value = secondsInput,
                     onValueChange = { secondsInput = it.filter(Char::isDigit) },
-                    label = { Text("最长开放秒数（5–30）") },
+                    label = { Text("校准最长开放秒数（5–30）") },
                     enabled = !snapshot.serviceRunning,
                     singleLine = true,
                 )
@@ -326,7 +326,7 @@ private fun MicBridgeScreen() {
                     } else transientMessage = "请输入 5–30"
                 }, enabled = !snapshot.serviceRunning) { Text("保存时限") }
                 Text(
-                    "超时后状态已回到 BLOCKED；此时下一次 toggle 会再次开放，而不是遵循按钮按压次数。",
+                    "仅用于声学校准。iPhone/Action Button 的 HTTP toggle 采用持续开放：再次按下时才切回 BLOCKED。服务重启或安全边界异常仍会故障安全屏蔽。",
                     style = MaterialTheme.typography.bodySmall,
                 )
             }

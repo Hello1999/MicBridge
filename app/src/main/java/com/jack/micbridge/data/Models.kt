@@ -35,7 +35,7 @@ sealed interface BridgeMicState {
     data object Starting : BridgeMicState
     data class Blocked(val observedAtEpochMs: Long) : BridgeMicState
     data class Open(
-        val autoBlockAtEpochMs: Long,
+        val autoBlockAtEpochMs: Long?,
         val observedAtEpochMs: Long,
     ) : BridgeMicState
     data class Transitioning(

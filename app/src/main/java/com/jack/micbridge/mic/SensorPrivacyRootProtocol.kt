@@ -19,11 +19,13 @@ internal object SensorPrivacyRootProtocol {
         USER_CONTEXT_READY=1
         USER_LIST_RAW=
         CURRENT_USER=
-        if ! USER_LIST_RAW=${'$'}($commandTimeout pm list users 2>/dev/null); then
+        # lease.lock occupies fd 0 in fail-safe callers. Detach Android Binder shell commands
+        # from that descriptor so system_server never inherits an adb_data_file as stdin.
+        if ! USER_LIST_RAW=${'$'}($commandTimeout pm list users </dev/null 2>/dev/null); then
           USER_CONTEXT_READY=0
           LAST=user-list-failed
         fi
-        if ! CURRENT_USER=${'$'}($commandTimeout am get-current-user 2>/dev/null); then
+        if ! CURRENT_USER=${'$'}($commandTimeout am get-current-user </dev/null 2>/dev/null); then
           USER_CONTEXT_READY=0
           LAST=current-user-failed
         fi
@@ -54,6 +56,20 @@ internal object SensorPrivacyRootProtocol {
 
     fun blockAllUsersAttempt(commandTimeout: String = COMMAND_TIMEOUT): String = """
         BLOCK_VERIFIED=0
+        # Block the frozen foreground user before the slower authoritative user discovery. This
+        # makes the active microphone lose access at the first safe instruction boundary while
+        # retaining the all-user enumeration and independent readback required for success.
+        TARGET_FAST_BLOCKED=0
+        case "${'$'}USER_ID" in
+          ''|*[!0-9]*) LAST=target-user-invalid ;;
+          *)
+            if $commandTimeout cmd sensor_privacy enable "${'$'}USER_ID" microphone </dev/null >/dev/null 2>&1; then
+              TARGET_FAST_BLOCKED=1
+            else
+              LAST=target-command-failed
+            fi
+            ;;
+        esac
         ${discoverUsersAttempt(commandTimeout)}
         if [ "${'$'}USER_CONTEXT_READY" = 1 ]; then
           TARGET_FOUND=0
@@ -65,7 +81,9 @@ internal object SensorPrivacyRootProtocol {
             if [ "${'$'}MB_USER" = "${'$'}USER_ID" ]; then
               TARGET_FOUND=1
             fi
-            if ! $commandTimeout cmd sensor_privacy enable "${'$'}MB_USER" microphone >/dev/null 2>&1; then
+            if [ "${'$'}MB_USER" = "${'$'}USER_ID" ] && [ "${'$'}TARGET_FAST_BLOCKED" = 1 ]; then
+              :
+            elif ! $commandTimeout cmd sensor_privacy enable "${'$'}MB_USER" microphone </dev/null >/dev/null 2>&1; then
               COMMANDS_OK=0
               LAST=command-failed
             fi
@@ -75,7 +93,7 @@ internal object SensorPrivacyRootProtocol {
             LAST=target-user-missing
           fi
           if [ "${'$'}COMMANDS_OK" = 1 ]; then
-            if OUT=${'$'}($commandTimeout dumpsys sensor_privacy 2>/dev/null); then
+            if OUT=${'$'}($commandTimeout dumpsys sensor_privacy </dev/null 2>/dev/null); then
               READBACK_OK=1
               for MB_USER in ${'$'}USER_IDS; do
                 if ! { ${blockedReadback("OUT", "MB_USER")}; }; then
@@ -91,6 +109,32 @@ internal object SensorPrivacyRootProtocol {
             fi
           fi
         fi
+    """.trimIndent()
+
+    /**
+     * Fast preflight used only before a guarded OPEN of the already frozen foreground user.
+     * Expiry, cancellation, boot, and emergency paths must continue to use
+     * [blockAllUsersAttempt].
+     */
+    fun blockTargetUserAttempt(commandTimeout: String = COMMAND_TIMEOUT): String = """
+        BLOCK_VERIFIED=0
+        case "${'$'}USER_ID" in
+          ''|*[!0-9]*) LAST=target-user-invalid ;;
+          *)
+            if ! $commandTimeout cmd sensor_privacy enable "${'$'}USER_ID" microphone </dev/null >/dev/null 2>&1; then
+              LAST=target-command-failed
+            elif OUT=${'$'}($commandTimeout dumpsys sensor_privacy </dev/null 2>/dev/null); then
+              MB_USER=${'$'}USER_ID
+              if { ${blockedReadback("OUT", "MB_USER")}; }; then
+                BLOCK_VERIFIED=1
+              else
+                LAST=target-readback-failed
+              fi
+            else
+              LAST=target-readback-command-failed
+            fi
+            ;;
+        esac
     """.trimIndent()
 
     fun blockedReadback(

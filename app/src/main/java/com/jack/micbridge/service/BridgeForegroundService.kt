@@ -12,6 +12,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioManager
+import android.util.Log
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -77,6 +78,7 @@ class BridgeForegroundService : Service() {
     private lateinit var coordinator: MicCoordinator
     private lateinit var auditLog: AuditLogRepository
     private lateinit var bootIncidentStore: BootIncidentStore
+    private lateinit var stateChangeSoundPlayer: StateChangeSoundPlayer
     @Volatile
     private var controllerProbeSummary: String? = null
     private var maintenanceGlobalBlockTarget: SafetyTarget? = null
@@ -108,6 +110,7 @@ class BridgeForegroundService : Service() {
     private var wakeLockRenewJob: Job? = null
     private var permissionMonitorJob: Job? = null
     private var networkAddressMonitorJob: Job? = null
+    private var stateChangeSoundJob: Job? = null
     @Volatile
     private var tetheringChangeMonitor: TetheringChangeMonitor.Monitor? = null
     private val observedNetworkLock = Any()
@@ -240,6 +243,7 @@ class BridgeForegroundService : Service() {
         settings = SettingsRepository(this)
         bootIncidentStore = BootIncidentStore(this)
         auditLog = AuditLogRepository(this)
+        stateChangeSoundPlayer = StateChangeSoundPlayer(this)
         rootShell = RootShell(onDiagnostic = auditLog::appendRoot)
         val startingSnapshot = ServiceRuntime.snapshot.value.copy(
             micAccess = MicAccessState.UNKNOWN,
@@ -414,6 +418,7 @@ class BridgeForegroundService : Service() {
                         calibrationMutex.withLock {
                             calibrationSession.reset()
                             val blocked = coordinator.localBlock("notification-block")
+                            queueStateChangeCue(blocked)
                             if (isSafeStoppedBoundary(blocked)) {
                                 val bootIncidentCleared = bootIncidentStore.clear()
                                 val maintenanceCleared = clearMaintenanceBoundaryIfUncontested(
@@ -474,6 +479,7 @@ class BridgeForegroundService : Service() {
                     ) {
                         coordinator.localBlock("calibration-isolation-refused-shutdown")
                     } else {
+                        val calibrationRootGate = SensorPrivacyRootController(rootShell)
                         calibrationMutex.withLock {
                             val before = settings.currentAcousticCalibrationIdentity()
                             if (!calibrationSession.matchesCurrentIdentity(before)) {
@@ -481,9 +487,15 @@ class BridgeForegroundService : Service() {
                                 publishCurrent("校准环境与第一步不一致；本轮作废并已屏蔽")
                             } else {
                                 val isolated = coordinator.calibrationIsolateRootFailsafe(
-                                    rootGate = SensorPrivacyRootController(rootShell),
+                                    rootGate = calibrationRootGate,
                                     audioGate = AudioManagerMicController(audioManager),
                                     appOpsVeto = AppOpsReadOnlyOpenVeto(rootShell, settings),
+                                    // Keep the fast audible cut inside the coordinator mutex so
+                                    // the 250 ms drift monitor cannot mistake this intentional
+                                    // split state for an external mutation and revoke the round.
+                                    immediateRootBlock = {
+                                        calibrationRootGate.blockCurrentUserImmediately()
+                                    },
                                 )
                                 val after = settings.currentAcousticCalibrationIdentity()
                                 val identityStable = calibrationSession.matchesCurrentIdentity(after)
@@ -656,6 +668,7 @@ class BridgeForegroundService : Service() {
                 tokenGeneration = { settings.tokenGeneration },
                 maxOpenSeconds = { settings.maxOpenSeconds },
                 calibrationValid = { settings.isAcousticCalibrationValid() },
+                persistentRemoteOpen = { true },
                 openAllowed = {
                     !shuttingDown &&
                         !stopCommittedBoundaryActive &&
@@ -696,6 +709,14 @@ class BridgeForegroundService : Service() {
         val startupBlock = coordinator.initialize()
         check(isSafeStartupBoundary(startupBlock)) {
             "启动 BLOCK 未获得新鲜可验证读回"
+        }
+        // Move the comparatively expensive immutable boot-guard deployment out of the user's
+        // OPEN button path. AutoBlockSafety keeps an in-process proof for this exact target;
+        // every OPEN still arms a fresh per-lease watcher and revalidates the live supervisor.
+        if (settings.rootBootGuardInstalled) {
+            check(safety.installOrRefreshRootBootGuard()) {
+                "已配置的 Root 开机保护无法在服务启动时刷新"
+            }
         }
         val probe = controller.probe()
         controllerProbeSummary = buildString {
@@ -955,6 +976,7 @@ class BridgeForegroundService : Service() {
                     error("麦克风变更事件在响应提交前持续变化")
                 }
             }
+            queueStateChangeCue(result)
             result
         } catch (cancelled: CancellationException) {
             // No exceptional exit may leave a second accepted request able to OPEN before the
@@ -1993,6 +2015,8 @@ class BridgeForegroundService : Service() {
                     ((snapshot.autoBlockAtEpochMs - System.currentTimeMillis() + 999L) / 1_000L)
                         .coerceAtLeast(0L)
                 } 秒后自动屏蔽"
+            snapshot.micAccess == MicAccessState.OPEN ->
+                "$address · 持续开放；再次按 Action Button 屏蔽"
             else -> "$address · ${controllerName(snapshot.controllerId)}"
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -2226,6 +2250,7 @@ class BridgeForegroundService : Service() {
             releaseWakeLock()
         }
         autoBlockJob?.cancel()
+        stateChangeSoundJob?.cancel()
         scope.cancel()
         super.onDestroy()
     }
@@ -2267,6 +2292,19 @@ class BridgeForegroundService : Service() {
             result.leaseExactAlarmArmed == null &&
             result.leaseRootWatchdogArmed == null
 
+    private fun queueStateChangeCue(result: OperationResult) {
+        val cue = stateChangeCueFor(result) ?: return
+        stateChangeSoundJob?.cancel()
+        stateChangeSoundJob = scope.launch {
+            runCatching { stateChangeSoundPlayer.play(cue) }
+                .onFailure { failure ->
+                    if (failure !is CancellationException) {
+                        Log.w(TAG, "Unable to play $cue state cue", failure)
+                    }
+                }
+        }
+    }
+
     private data class NetworkObservation(
         var capabilities: NetworkCapabilities? = null,
         var linkProperties: LinkProperties? = null,
@@ -2274,6 +2312,7 @@ class BridgeForegroundService : Service() {
     )
 
     companion object {
+        private const val TAG = "MicBridgeService"
         const val ACTION_START = "com.jack.micbridge.START"
         const val ACTION_BLOCK = "com.jack.micbridge.BLOCK"
         const val ACTION_CALIBRATION_OPEN = "com.jack.micbridge.CALIBRATION_OPEN"

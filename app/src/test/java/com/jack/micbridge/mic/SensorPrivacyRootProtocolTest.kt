@@ -9,6 +9,57 @@ import java.util.concurrent.TimeUnit
 
 class SensorPrivacyRootProtocolTest {
     @Test
+    fun `framework commands detach the inherited lease lock from stdin`() {
+        val discovery = SensorPrivacyRootProtocol.discoverUsersAttempt()
+        val block = SensorPrivacyRootProtocol.blockAllUsersAttempt()
+
+        assertTrue(discovery.contains("timeout -k 0.1 0.5 pm list users </dev/null 2>/dev/null"))
+        assertTrue(discovery.contains("timeout -k 0.1 0.5 am get-current-user </dev/null 2>/dev/null"))
+        assertTrue(
+            block.contains(
+                "timeout -k 0.1 0.5 cmd sensor_privacy enable \"\$MB_USER\" " +
+                    "microphone </dev/null >/dev/null 2>&1",
+            ),
+        )
+        assertTrue(
+            block.contains(
+                "timeout -k 0.1 0.5 dumpsys sensor_privacy </dev/null 2>/dev/null",
+            ),
+        )
+    }
+
+    @Test
+    fun `block gates the frozen foreground user before authoritative discovery`() {
+        val block = SensorPrivacyRootProtocol.blockAllUsersAttempt()
+        val fastBlock = block.indexOf(
+            "cmd sensor_privacy enable \"\$USER_ID\" microphone",
+        )
+        val discovery = block.indexOf("pm list users")
+
+        assertTrue(fastBlock >= 0)
+        assertTrue(discovery > fastBlock)
+        assertTrue(block.contains("TARGET_FAST_BLOCKED=1"))
+        assertTrue(
+            block.contains(
+                "[ \"\$MB_USER\" = \"\$USER_ID\" ] && " +
+                    "[ \"\$TARGET_FAST_BLOCKED\" = 1 ]",
+            ),
+        )
+    }
+
+    @Test
+    fun `target preflight blocks and independently reads only the frozen user`() {
+        val preflight = SensorPrivacyRootProtocol.blockTargetUserAttempt()
+
+        assertTrue(preflight.contains("sensor_privacy enable \"\$USER_ID\" microphone"))
+        assertTrue(preflight.contains("dumpsys sensor_privacy"))
+        assertTrue(preflight.contains("MB_USER=\$USER_ID"))
+        assertTrue(preflight.contains("BLOCK_VERIFIED=1"))
+        assertFalse(preflight.contains("pm list users"))
+        assertFalse(preflight.contains("for MB_USER in \$USER_IDS"))
+    }
+
+    @Test
     fun `root readback rejects an unscoped pre-user state`() {
         val output = """
             sensor=1

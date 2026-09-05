@@ -40,7 +40,7 @@ class SensorPrivacyRootController(
         target: SafetyTarget,
         authorization: OpenAuthorization,
     ): ControlResult {
-        if (!isValidTarget(target) || currentUserId() != target.userId) {
+        if (!isValidTarget(target)) {
             return failed(false, System.nanoTime(), "CONTROL_CONTEXT_MISMATCH", "安全租约用户与当前用户不一致")
         }
         return setPrivacy(
@@ -48,6 +48,25 @@ class SensorPrivacyRootController(
             userId = target.userId,
             authorization = authorization,
         )
+    }
+
+    /**
+     * Takes the safe direction at the very start of the Root-only acoustic test. The caller still
+     * has to run [block] afterwards: that slower path covers every Android user and independently
+     * verifies the result. This preliminary mutation exists only to make the audible cut-off
+     * immediate instead of waiting behind the full calibration proof.
+     */
+    suspend fun blockCurrentUserImmediately(): Boolean {
+        val result = shell.execute(
+            """
+                set -e
+                CURRENT_USER=${'$'}(am get-current-user </dev/null 2>/dev/null)
+                case "${'$'}CURRENT_USER" in ''|*[!0-9]*) exit 76;; esac
+                cmd sensor_privacy enable "${'$'}CURRENT_USER" microphone </dev/null >/dev/null
+                printf '%s\n' "${'$'}CURRENT_USER"
+            """.trimIndent(),
+        )
+        return result.succeeded && result.stdout.trim().toIntOrNull()?.let { it >= 0 } == true
     }
 
     override suspend fun readState(target: SafetyTarget?): MicAccessState {
@@ -79,7 +98,13 @@ class SensorPrivacyRootController(
                 [ "${'$'}BLOCK_VERIFIED" = 1 ]
             """.trimIndent()
         } else {
-            "cmd sensor_privacy disable $userId microphone"
+            """
+                CURRENT_USER=${'$'}(am get-current-user </dev/null 2>/dev/null) || exit 76
+                case "${'$'}CURRENT_USER" in ''|*[!0-9]*) exit 76;; esac
+                [ "${'$'}CURRENT_USER" = ${RootShell.quote(userId.toString())} ] || exit 77
+                cmd sensor_privacy disable ${RootShell.quote(userId.toString())} microphone </dev/null >/dev/null
+                dumpsys sensor_privacy </dev/null
+            """.trimIndent()
         }
         val command = if (enabled) {
             rawCommand
@@ -92,7 +117,15 @@ class SensorPrivacyRootController(
             ))
         }
         val result = shell.execute(command)
-        val observed = readStateForUser(userId)
+        // The all-user BLOCK fragment only exits successfully after its own fresh dumpsys
+        // verification. OPEN emits the fresh dumpsys from inside the authorization flock. Avoid
+        // paying for a second Root process on the success path; failures still get an independent
+        // best-effort read so the caller can report a safe BLOCKED outcome when possible.
+        val observed = when {
+            enabled && result.succeeded -> MicAccessState.BLOCKED
+            !enabled && result.succeeded -> parseMicrophoneState(result.stdout, userId)
+            else -> readStateForUser(userId)
+        }
         val requested = if (enabled) MicAccessState.BLOCKED else MicAccessState.OPEN
         val verified = result.succeeded && observed == requested
         return ControlResult(

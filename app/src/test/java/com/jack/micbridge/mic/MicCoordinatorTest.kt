@@ -153,6 +153,36 @@ class MicCoordinatorTest {
     }
 
     @Test
+    fun `persistent remote toggle stays open past timed limit until next toggle`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            persistentRemoteOpen = true,
+        )
+
+        val opened = fixture.coordinator.execute(
+            MicCoordinator.ENDPOINT_TOGGLE,
+            "request-persistent-open-01",
+        )
+        fixture.time += 120_000L
+        val stillOpen = fixture.coordinator.readSnapshot(true, emptyList())
+        val blocked = fixture.coordinator.execute(
+            MicCoordinator.ENDPOINT_TOGGLE,
+            "request-persistent-block-02",
+        )
+
+        assertTrue(opened.ok)
+        assertEquals(MicAccessState.OPEN, opened.micAccess)
+        assertNull(opened.autoBlockAtEpochMs)
+        assertEquals(false, opened.leaseExactAlarmArmed)
+        assertEquals(1, fixture.lease.persistentArmCount)
+        assertEquals(MicAccessState.OPEN, stillOpen.micAccess)
+        assertNull(stillOpen.autoBlockAtEpochMs)
+        assertTrue(blocked.ok)
+        assertEquals(MicAccessState.BLOCKED, blocked.micAccess)
+        assertEquals(1, fixture.lease.cancelCount)
+    }
+
+    @Test
     fun `status cannot report OPEN after the PID bound Root guard is unhealthy`() = runTest {
         val fixture = Fixture(
             initialState = MicAccessState.BLOCKED,
@@ -462,12 +492,18 @@ class MicCoordinatorTest {
 
             val rootGate = FakeController(MicAccessState.OPEN, "root_sensor_privacy")
             val audioGate = FakeController(MicAccessState.OPEN, "audio_manager")
+            var immediateBlockCalled = false
             val isolated = fixture.coordinator.calibrationIsolateRootFailsafe(
-                rootGate,
-                audioGate,
-                ReadOnlyOpenVeto { MicAccessState.OPEN },
+                rootGate = rootGate,
+                audioGate = audioGate,
+                appOpsVeto = ReadOnlyOpenVeto { MicAccessState.OPEN },
+                immediateRootBlock = {
+                    immediateBlockCalled = true
+                    true
+                },
             )
 
+            assertTrue(immediateBlockCalled)
             assertTrue(isolated.controlReadback)
             assertEquals(MicAccessState.BLOCKED, rootGate.state)
             assertEquals(MicAccessState.OPEN, audioGate.state)
@@ -485,6 +521,29 @@ class MicCoordinatorTest {
             assertEquals(MicAccessState.BLOCKED, fixture.controller.state)
             assertEquals(1, fixture.lease.cancelCount)
         }
+
+    @Test
+    fun `failed immediate root block restores full block`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            calibrated = false,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = true
+        fixture.coordinator.calibrationOpen()
+
+        val isolated = fixture.coordinator.calibrationIsolateRootFailsafe(
+            rootGate = FakeController(MicAccessState.OPEN, "root_sensor_privacy"),
+            audioGate = FakeController(MicAccessState.OPEN, "audio_manager"),
+            appOpsVeto = ReadOnlyOpenVeto { MicAccessState.OPEN },
+            immediateRootBlock = { false },
+        )
+
+        assertFalse(isolated.controlReadback)
+        assertEquals("CALIBRATION_IMMEDIATE_ROOT_BLOCK_FAILED", isolated.errorCode)
+        assertEquals(MicAccessState.BLOCKED, fixture.controller.state)
+        assertEquals(1, fixture.lease.cancelCount)
+    }
 
     @Test
     fun `coupled root and AudioManager controls cannot pass isolated calibration`() = runTest {
@@ -828,6 +887,7 @@ class MicCoordinatorTest {
         initialState: MicAccessState,
         calibrated: Boolean = true,
         controllerId: String = "fake",
+        persistentRemoteOpen: Boolean = false,
         failSnapshotWhen: (BridgeSnapshot) -> Boolean = { false },
     ) {
         var time = 0L
@@ -846,6 +906,7 @@ class MicCoordinatorTest {
             tokenGeneration = { 1 },
             maxOpenSeconds = { 30 },
             calibrationValid = { calibratedState },
+            persistentRemoteOpen = { persistentRemoteOpen },
             openAllowed = { openAllowed },
             remoteOpenAllowed = { _: Long -> remoteOpenAllowed },
             nowEpochMs = { time },
@@ -913,6 +974,7 @@ class MicCoordinatorTest {
         var persistLeaseOnFailedArm = true
         var failCancelWhenNoLease = false
         var armCount = 0
+        var persistentArmCount = 0
         var rootWatchdogArmed = false
         var guardHealthy = true
         var guardVerificationCount = 0
@@ -947,6 +1009,32 @@ class MicCoordinatorTest {
                 exactAlarmArmed = armSucceeds,
                 rootWatchdogArmed = rootWatchdogArmed,
                 error = if (armSucceeds) null else "not armed",
+            )
+        }
+
+        override suspend fun armPersistent(
+            requestId: String,
+            target: SafetyTarget,
+        ): LeaseArmResult {
+            persistentArmCount++
+            val deadline = 0L
+            activeLease = ActiveSafetyLease(
+                requestId = requestId,
+                target = target,
+                deadlineEpochMs = deadline,
+                deadlineElapsedRealtimeMs = deadline,
+                exactAlarmArmed = false,
+                rootWatchdogArmed = rootWatchdogArmed,
+                persistent = true,
+            )
+            return LeaseArmResult(
+                armed = armSucceeds,
+                deadlineEpochMs = deadline,
+                deadlineElapsedRealtimeMs = deadline,
+                exactAlarmArmed = false,
+                rootWatchdogArmed = rootWatchdogArmed,
+                error = if (armSucceeds) null else "not armed",
+                persistent = true,
             )
         }
 

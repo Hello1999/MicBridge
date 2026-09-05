@@ -24,6 +24,7 @@ class MicCoordinator(
     private val tokenGeneration: () -> Int,
     private val maxOpenSeconds: () -> Int,
     private val calibrationValid: () -> Boolean,
+    private val persistentRemoteOpen: () -> Boolean = { false },
     private val openAllowed: () -> Boolean = { true },
     private val remoteOpenAllowed: (Long) -> Boolean = { true },
     private val nowEpochMs: () -> Long = System::currentTimeMillis,
@@ -40,6 +41,7 @@ class MicCoordinator(
     private var activeLeaseDeadlineElapsedRealtimeMs: Long? = null
     private var activeLeaseExactAlarmArmed: Boolean? = null
     private var activeLeaseRootWatchdogArmed: Boolean? = null
+    private var activeLeasePersistent = false
     private var calibrationIsolationActive = false
 
     suspend fun activeRootGuardHealthy(): Boolean = mutex.withLock {
@@ -157,6 +159,8 @@ class MicCoordinator(
             requestId,
             requireCalibration = true,
             remoteGeneration = remoteGeneration,
+            persistentOpen = endpoint == ENDPOINT_TOGGLE &&
+                target == MicAccessState.OPEN && persistentRemoteOpen(),
         )
         persist(requestId, result)
         recordRemote(result)
@@ -174,12 +178,20 @@ class MicCoordinator(
                     sourceId,
                     requireCalibration = false,
                     remoteGeneration = null,
+                    persistentOpen = false,
                 ),
             )
         }
 
     suspend fun calibrationOpen(): OperationResult = mutex.withLock {
-        val previous = controller.readState(activeLeaseTarget)
+        // A freshly initialized BLOCKED coordinator already owns a verified observation. The
+        // guarded OPEN transition will block and verify again before arming its fail-safe lease,
+        // so another Root read here only delays the user's explicit calibration action.
+        val previous = if (state is BridgeMicState.Blocked) {
+            MicAccessState.BLOCKED
+        } else {
+            controller.readState(activeLeaseTarget)
+        }
         record(
             "calibration",
             transition(
@@ -188,6 +200,7 @@ class MicCoordinator(
                 "cal-${UUID.randomUUID()}",
                 requireCalibration = false,
                 remoteGeneration = null,
+                persistentOpen = false,
             ),
         )
     }
@@ -206,14 +219,13 @@ class MicCoordinator(
         rootGate: MicController,
         audioGate: MicController,
         appOpsVeto: ReadOnlyOpenVeto,
+        immediateRootBlock: suspend () -> Boolean = { true },
     ): ControlResult = mutex.withLock {
-        val combinedBefore = controller.readState(activeLeaseTarget)
         val requestId = activeLeaseRequestId
         val deadlineElapsed = activeLeaseDeadlineElapsedRealtimeMs
         val leaseHealthy = state is BridgeMicState.Open && hasHealthyActiveLease()
         if (
-            combinedBefore != MicAccessState.OPEN || !leaseHealthy || requestId == null ||
-            deadlineElapsed == null
+            !leaseHealthy || requestId == null || deadlineElapsed == null
         ) {
             return@withLock failCalibrationIsolation(
                 "CALIBRATION_OPEN_LEASE_REQUIRED",
@@ -225,6 +237,12 @@ class MicCoordinator(
             "CALIBRATION_TARGET_UNKNOWN",
             "校准租约目标无法确认；已优先恢复全局屏蔽",
         )
+        if (!immediateRootBlock()) {
+            return@withLock failCalibrationIsolation(
+                "CALIBRATION_IMMEDIATE_ROOT_BLOCK_FAILED",
+                "无法立即执行当前用户的 Root 屏蔽；已优先恢复全局屏蔽",
+            )
+        }
         val rootTarget = rootGate.captureSafetyTarget()
         val audioTarget = audioGate.captureSafetyTarget()
         if (
@@ -422,6 +440,7 @@ class MicCoordinator(
         requestId: String,
         requireCalibration: Boolean,
         remoteGeneration: Long?,
+        persistentOpen: Boolean,
     ): OperationResult {
         calibrationIsolationActive = false
         state = BridgeMicState.Transitioning(previous, target)
@@ -497,7 +516,7 @@ class MicCoordinator(
                     "声学校准在 OPEN 状态确认期间失效；已立即优先尝试屏蔽",
                 )
             }
-            val deadline = activeLeaseDeadlineEpochMs
+            val deadline = activeLeaseDeadlineEpochMs.takeUnless { activeLeasePersistent }
             val confirmed = ControlResult(
                 requested = MicAccessState.OPEN,
                 observed = MicAccessState.OPEN,
@@ -545,7 +564,11 @@ class MicCoordinator(
             // guard rejected the request before writing a lease (for example, after ownership
             // recovery). Reconcile from the durable store on every failed/exceptional arm.
             val lease = try {
-                leaseSafety.arm(requestId, maxOpenSeconds(), frozenTarget)
+                if (persistentOpen) {
+                    leaseSafety.armPersistent(requestId, frozenTarget)
+                } else {
+                    leaseSafety.arm(requestId, maxOpenSeconds(), frozenTarget)
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
@@ -569,6 +592,7 @@ class MicCoordinator(
                     deadlineElapsedRealtimeMs = lease.deadlineElapsedRealtimeMs,
                     exactAlarmArmed = lease.exactAlarmArmed,
                     rootWatchdogArmed = lease.rootWatchdogArmed,
+                    persistent = lease.persistent,
                 )
                 val safetyBlock = blockThenCancelLeaseIfVerified(fallbackTarget = frozenTarget)
                 updateStateFrom(safetyBlock, null)
@@ -578,7 +602,11 @@ class MicCoordinator(
                     requestId = requestId,
                     forcedOk = false,
                     overrideCode = "LEASE_GUARD_NOT_ARMED",
-                    overrideMessage = lease.error ?: "30 秒安全租约未布防",
+                    overrideMessage = lease.error ?: if (persistentOpen) {
+                        "持续开放安全监督器未布防"
+                    } else {
+                        "临时开放安全租约未布防"
+                    },
                 )
             }
             activeLeaseTarget = frozenTarget
@@ -587,6 +615,7 @@ class MicCoordinator(
             activeLeaseDeadlineElapsedRealtimeMs = lease.deadlineElapsedRealtimeMs.takeIf { it > 0L }
             activeLeaseExactAlarmArmed = lease.exactAlarmArmed
             activeLeaseRootWatchdogArmed = lease.rootWatchdogArmed
+            activeLeasePersistent = lease.persistent
 
             // Do not create even a brief capture window when a guard reports internally
             // inconsistent flags, or when setup consumed the entire monotonic lease. The
@@ -614,14 +643,22 @@ class MicCoordinator(
                 )
             }
 
-            val openValidUntilElapsed = activeLeaseDeadlineElapsedRealtimeMs
-                ?: return failedOpen(
-                    previous,
-                    requestId,
-                    "LEASE_INVALID_BEFORE_OPEN",
-                    "安全租约缺少 OPEN 授权截止时间；已拒绝开放",
-                )
-            val authorization = OpenAuthorization(requestId, openValidUntilElapsed)
+            val openValidUntilElapsed = if (activeLeasePersistent) {
+                0L
+            } else {
+                activeLeaseDeadlineElapsedRealtimeMs
+                    ?: return failedOpen(
+                        previous,
+                        requestId,
+                        "LEASE_INVALID_BEFORE_OPEN",
+                        "安全租约缺少 OPEN 授权截止时间；已拒绝开放",
+                    )
+            }
+            val authorization = OpenAuthorization(
+                requestId,
+                openValidUntilElapsed,
+                persistent = activeLeasePersistent,
+            )
             val opened = try {
                 leaseSafety.withMutationLock {
                     val lifecycleAllowedAtDispatch = openAllowed()
@@ -768,14 +805,14 @@ class MicCoordinator(
 
             updateStateFrom(
                 opened,
-                lease.deadlineEpochMs,
+                lease.deadlineEpochMs.takeUnless { lease.persistent },
                 calibrationOverride = if (requireCalibration) calibrationAtCommit else null,
             )
             return operationFrom(
                 opened,
                 previous,
                 requestId,
-                autoBlockAt = lease.deadlineEpochMs,
+                autoBlockAt = lease.deadlineEpochMs.takeUnless { lease.persistent },
                 calibrationOverride = if (requireCalibration) calibrationAtCommit else null,
             )
         }
@@ -832,7 +869,7 @@ class MicCoordinator(
             acousticCalibrationValid = calibrationValid(),
             controllerId = controller.id,
             requestId = requestId,
-            autoBlockAtEpochMs = activeLeaseDeadlineEpochMs,
+            autoBlockAtEpochMs = activeAutoBlockAtEpochMs(),
             latencyMs = observation.latencyMs,
             leaseExactAlarmArmed = activeLeaseExactAlarmArmed,
             leaseRootWatchdogArmed = activeLeaseRootWatchdogArmed,
@@ -900,7 +937,7 @@ class MicCoordinator(
             acousticCalibrationValid = calibrationValid(),
             controllerId = controller.id,
             requestId = requestId,
-            autoBlockAtEpochMs = activeLeaseDeadlineEpochMs,
+            autoBlockAtEpochMs = activeAutoBlockAtEpochMs(),
             latencyMs = observation.latencyMs,
             leaseExactAlarmArmed = activeLeaseExactAlarmArmed,
             leaseRootWatchdogArmed = activeLeaseRootWatchdogArmed,
@@ -971,8 +1008,8 @@ class MicCoordinator(
         state = when {
             result.controlReadback && result.observed == MicAccessState.BLOCKED ->
                 BridgeMicState.Blocked(now)
-            result.controlReadback && result.observed == MicAccessState.OPEN && autoBlockAt != null -> {
-                activeLeaseDeadlineEpochMs = autoBlockAt
+            result.controlReadback && result.observed == MicAccessState.OPEN -> {
+                if (autoBlockAt != null) activeLeaseDeadlineEpochMs = autoBlockAt
                 BridgeMicState.Open(autoBlockAt, now)
             }
             else -> BridgeMicState.ErrorUnverified(
@@ -1009,7 +1046,7 @@ class MicCoordinator(
         controllerId = controller.id,
         serviceRunning = serviceRunning,
         serverAddresses = addresses,
-        autoBlockAtEpochMs = activeLeaseDeadlineEpochMs,
+        autoBlockAtEpochMs = activeAutoBlockAtEpochMs(),
         leaseExactAlarmArmed = activeLeaseExactAlarmArmed,
         leaseRootWatchdogArmed = activeLeaseRootWatchdogArmed,
         lastError = error,
@@ -1085,6 +1122,7 @@ class MicCoordinator(
         deadlineElapsedRealtimeMs: Long = 0L,
         exactAlarmArmed: Boolean = false,
         rootWatchdogArmed: Boolean = false,
+        persistent: Boolean = false,
     ) {
         clearActiveLeaseFields()
         val loaded = try {
@@ -1099,6 +1137,7 @@ class MicCoordinator(
                 deadlineElapsedRealtimeMs.takeIf { it > 0L }
             activeLeaseExactAlarmArmed = exactAlarmArmed
             activeLeaseRootWatchdogArmed = rootWatchdogArmed
+            activeLeasePersistent = persistent
             return
         }
         restoreActiveLease(loaded)
@@ -1109,7 +1148,7 @@ class MicCoordinator(
         val target = activeLeaseTarget
         val observed = controller.readState(target)
         if (observed == MicAccessState.OPEN && hasHealthyActiveLease()) {
-            val deadline = activeLeaseDeadlineEpochMs ?: nowEpochMs()
+            val deadline = activeLeaseDeadlineEpochMs.takeUnless { activeLeasePersistent }
             state = BridgeMicState.Open(deadline, nowEpochMs())
             return SafetyObservation(observed, true, null, 0L)
         }
@@ -1161,9 +1200,11 @@ class MicCoordinator(
 
     private fun hasValidActiveLease(): Boolean {
         val target = activeLeaseTarget ?: return false
-        val deadline = activeLeaseDeadlineElapsedRealtimeMs ?: return false
-        if (deadline <= elapsedRealtimeMs()) return false
-        if (activeLeaseExactAlarmArmed != true) return false
+        if (!activeLeasePersistent) {
+            val deadline = activeLeaseDeadlineElapsedRealtimeMs ?: return false
+            if (deadline <= elapsedRealtimeMs()) return false
+            if (activeLeaseExactAlarmArmed != true) return false
+        }
         val rootWatchdogRequired = target.controllerId in setOf(
             com.jack.micbridge.data.SettingsRepository.CONTROLLER_AUDIO_MANAGER,
             com.jack.micbridge.data.SettingsRepository.CONTROLLER_APP_OPS,
@@ -1171,6 +1212,9 @@ class MicCoordinator(
         )
         return !rootWatchdogRequired || activeLeaseRootWatchdogArmed == true
     }
+
+    private fun activeAutoBlockAtEpochMs(): Long? =
+        activeLeaseDeadlineEpochMs.takeUnless { activeLeasePersistent }
 
     /**
      * An in-memory `armed=true` bit is historical, not current proof. Every externally visible
@@ -1198,6 +1242,7 @@ class MicCoordinator(
         activeLeaseDeadlineElapsedRealtimeMs = lease.deadlineElapsedRealtimeMs
         activeLeaseExactAlarmArmed = lease.exactAlarmArmed
         activeLeaseRootWatchdogArmed = lease.rootWatchdogArmed
+        activeLeasePersistent = lease.persistent
     }
 
     private fun clearActiveLeaseFields() {
@@ -1207,6 +1252,7 @@ class MicCoordinator(
         activeLeaseDeadlineElapsedRealtimeMs = null
         activeLeaseExactAlarmArmed = null
         activeLeaseRootWatchdogArmed = null
+        activeLeasePersistent = false
     }
 
     private fun controlFailure(

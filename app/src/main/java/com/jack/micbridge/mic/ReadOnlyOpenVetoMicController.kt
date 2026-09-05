@@ -167,14 +167,15 @@ class AppOpsReadOnlyOpenVeto(
         private val NON_VETO_MODES = setOf(
             AppOpsModeReader.MODE_ALLOW,
             AppOpsModeReader.MODE_DEFAULT,
+            AppOpsModeReader.MODE_FOREGROUND,
         )
 
         fun modesToVetoState(
             modes: AppOpsModeReader.Companion.ParsedModes?,
         ): MicAccessState {
-            // A non-default UID mode overrides package scope. `foreground` is deliberately not
-            // accepted: its effective result depends on current UID process state and a raw
-            // `appops get` value cannot prove that ChatGPT may record while locked/background.
+            // A non-default UID mode overrides package scope. `foreground` is conditional on the
+            // target UID's live process state, but it is not an explicit AppOps denial. This layer
+            // only detects hard vetoes; it does not claim that ChatGPT can currently record.
             return when (modes?.effectiveMode) {
                 in EXPLICIT_VETO_MODES -> MicAccessState.BLOCKED
                 in NON_VETO_MODES -> MicAccessState.OPEN

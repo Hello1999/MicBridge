@@ -8,6 +8,7 @@ import com.jack.micbridge.data.SafetyTarget
 data class OpenAuthorization(
     val requestId: String,
     val validUntilElapsedRealtimeMs: Long,
+    val persistent: Boolean = false,
 )
 
 interface MicController {

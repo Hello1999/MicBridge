@@ -79,6 +79,39 @@ class RootFailSafeScriptsTest {
     }
 
     @Test
+    fun `watcher writes timed wake lock as one sysfs payload`() {
+        val script = watcher(SettingsRepository.CONTROLLER_SENSOR_PRIVACY)
+
+        assertTrue(script.contains("WAKE_PAYLOAD=\"\$WAKE_TAG \$WAKE_TIMEOUT_NANOS\""))
+        assertTrue(script.contains("printf %s \"\$WAKE_PAYLOAD\" > /sys/power/wake_lock"))
+        assertFalse(
+            script.contains(
+                "printf '%s %s' \"\$WAKE_TAG\" \"\$WAKE_TIMEOUT_NANOS\" > /sys/power/wake_lock",
+            ),
+        )
+    }
+
+    @Test
+    fun `persistent watcher stays armed until its marker is replaced`() {
+        val script = RootFailSafeScripts.watcher(
+            controllerId = SettingsRepository.CONTROLLER_SENSOR_PRIVACY,
+            targetPackage = "android-global-microphone",
+            userId = 0,
+            requestId = "request-persistent-01",
+            deadlineElapsedRealtimeMs = 0L,
+            blockAtElapsedRealtimeMs = 0L,
+            watcherPath = "/data/adb/micbridge/watch-request-persistent-01.sh",
+            watcherStatusPath = "/data/adb/micbridge/watch-request-persistent-01.status",
+            wakeTag = "micbridge-request-persistent-01",
+            persistent = true,
+        )!!
+
+        assertTrue(script.contains("PERSISTENT=1"))
+        assertTrue(script.contains("write_status \"armed-\$REQUEST_ID-\$SELF_PID\""))
+        assertTrue(script.contains("if [ \"\$CURRENT\" != \"\$REQUEST_ID\" ]; then"))
+    }
+
+    @Test
     fun `watcher uses crash releasing flock correct traps and bounded control calls`() {
         val script = watcher(SettingsRepository.CONTROLLER_SENSOR_PRIVACY)
 
@@ -99,7 +132,9 @@ class RootFailSafeScriptsTest {
 
         assertTrue(script.contains("write_status \"arm-lock-failed-\$REQUEST_ID\""))
         val contentionOffsets = Regex("lock-contended-\\\$REQUEST_ID").findAll(script).map { it.range.first }.toList()
-        assertEquals(2, contentionOffsets.size)
+        // Timed watchers contain the pre-deadline and enforcement retries. The generated
+        // script also carries the persistent-mode marker loop behind a false branch.
+        assertEquals(3, contentionOffsets.size)
         contentionOffsets.forEach { offset ->
             val retry = script.indexOf("continue", startIndex = offset)
             val fatalExit = script.indexOf("exit 1", startIndex = offset)
@@ -197,6 +232,14 @@ class RootFailSafeScriptsTest {
         assertTrue(preflightBlock > markerCheck)
         assertTrue(preflightVerify > preflightBlock)
         assertTrue(armed > preflightVerify)
+        val preflight = script.substring(markerCheck, armed)
+        assertFalse(preflight.contains("pm list users"))
+        assertTrue(preflight.contains("MB_USER=\$USER_ID"))
+
+        // Deadline enforcement remains the authoritative all-user fail-closed operation.
+        val terminal = script.substring(armed)
+        assertTrue(terminal.contains("pm list users"))
+        assertTrue(terminal.contains("for MB_USER in \$USER_IDS"))
     }
 
     @Test
@@ -242,6 +285,7 @@ class RootFailSafeScriptsTest {
         assertTrue(script.contains("PKG='com.openai.chatgpt'"))
         assertTrue(script.contains("USER_ID='10'"))
         assertTrue(script.contains("flock -n -x 0"))
+        assertTrue(script.indexOf("exec 0>>\"\$LOCK_FILE\"") < script.indexOf("if ! acquire_lock; then"))
         assertTrue(script.contains("CURRENT_GENERATION"))
         assertTrue(script.contains("CURRENT_GENERATION\" != \"\$GENERATION"))
         assertTrue(
@@ -257,7 +301,7 @@ class RootFailSafeScriptsTest {
 
         val selfStart = script.indexOf("SELF_START=\$(awk")
         val pidRecord = script.indexOf("printf '%s|%s\\n' \"\$\$\" \"\$SELF_START\"")
-        val pidCleanup = script.indexOf("PID_RECORD%%|*")
+        val pidCleanup = script.indexOf("PID_RECORD%%\\|*")
         assertTrue(selfStart >= 0)
         assertTrue(pidRecord > selfStart)
         assertTrue(pidCleanup >= 0)
@@ -277,9 +321,25 @@ class RootFailSafeScriptsTest {
         assertTrue(launcher.contains("boot-current"))
         assertTrue(launcher.contains("boot-\$GENERATION.sh"))
         assertTrue(launcher.contains("supervisor.lock"))
-        assertTrue(launcher.contains("flock -n -x 9"))
+        assertTrue(launcher.contains("exec 0>>\"\$SUPERVISOR_LOCK\""))
+        assertTrue(launcher.contains("flock -n -x 0"))
+        assertTrue(launcher.contains("flock -u 0"))
+        assertFalse(launcher.contains("flock -n -x 9"))
         assertTrue(launcher.contains("sh \"\$VERSION_SCRIPT\""))
         assertTrue(launcher.contains("while [ -f \"\$GENERATION_FILE\" ]"))
+        assertFalse(launcher.contains("lease.lock"))
+        assertTrue(
+            launcher.indexOf("exec 0>>\"\$SUPERVISOR_LOCK\"") <
+                launcher.indexOf("flock -n -x 0"),
+        )
+        assertTrue(
+            launcher.indexOf("flock -n -x 0") <
+                launcher.indexOf("sh \"\$VERSION_SCRIPT\""),
+        )
+        assertTrue(
+            launcher.indexOf("sh \"\$VERSION_SCRIPT\"") <
+                launcher.lastIndexOf("flock -u 0"),
+        )
     }
 
     @Test
@@ -373,6 +433,75 @@ class RootFailSafeScriptsTest {
             assertTrue("shell syntax check timed out", process.waitFor(5, TimeUnit.SECONDS))
             val error = process.errorStream.bufferedReader().use { it.readText() }
             assertEquals(error, 0, process.exitValue())
+        }
+    }
+
+    @Test
+    fun `generated timing awk emits a real newline instead of literal backslash n`() {
+        val scripts = listOf(
+            RootFailSafeScripts.bootGuard(
+                SettingsRepository.CONTROLLER_SENSOR_PRIVACY,
+                "android-global-microphone",
+                0,
+                "g-timing-newline",
+            )!!,
+            watcher(SettingsRepository.CONTROLLER_SENSOR_PRIVACY),
+        )
+
+        scripts.forEach { script ->
+            assertTrue(script.contains("printf \"%.0f\\n\""))
+            assertFalse(script.contains("printf \"%.0f\\\\n\""))
+        }
+    }
+
+    @Test
+    fun `generated pid records escape mksh pattern alternation`() {
+        val scripts = listOf(
+            RootFailSafeScripts.bootGuard(
+                SettingsRepository.CONTROLLER_SENSOR_PRIVACY,
+                "android-global-microphone",
+                0,
+                "g-mksh-pid-split",
+            )!!,
+            watcher(SettingsRepository.CONTROLLER_SENSOR_PRIVACY),
+        )
+
+        scripts.forEach { script ->
+            assertFalse(script.contains("%%|*"))
+            assertFalse(script.contains("#*|"))
+        }
+        assertTrue(scripts.first().contains("PID_RECORD%%\\|*"))
+        assertTrue(scripts.first().contains("APP_PROC%%\\|*"))
+        assertTrue(scripts.first().contains("APP_PROC#*\\|"))
+    }
+
+    @Test
+    fun `generated framework calls detach inherited lock stdin`() {
+        val scripts = listOf(
+            RootFailSafeScripts.bootGuard(
+                SettingsRepository.CONTROLLER_SENSOR_PRIVACY,
+                "android-global-microphone",
+                0,
+                "g-framework-stdin",
+            )!!,
+            watcher(SettingsRepository.CONTROLLER_SENSOR_PRIVACY),
+            RootFailSafeScripts.revokeLease(
+                SettingsRepository.CONTROLLER_SENSOR_PRIVACY,
+                "android-global-microphone",
+                0,
+                "request-framework-stdin",
+                "cancel-request-framework-stdin-1-2",
+            )!!,
+        )
+        val frameworkCommand = Regex(
+            "timeout -k 0\\.1 0\\.5 (?:pm list users|am get-current-user|" +
+                "cmd sensor_privacy enable|dumpsys sensor_privacy)",
+        )
+
+        scripts.forEach { script ->
+            val commandLines = script.lineSequence().filter(frameworkCommand::containsMatchIn).toList()
+            assertTrue(commandLines.isNotEmpty())
+            commandLines.forEach { line -> assertTrue(line, line.contains("</dev/null")) }
         }
     }
 
