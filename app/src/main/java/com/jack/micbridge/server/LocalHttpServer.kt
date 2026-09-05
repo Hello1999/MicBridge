@@ -1,5 +1,6 @@
 package com.jack.micbridge.server
 
+import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.net.Inet4Address
 import java.net.InetSocketAddress
@@ -66,6 +67,9 @@ class LocalHttpServer(
                 if (running.get()) onError("HTTP accept 失败：${error.message}")
                 continue
             }
+            // The response head and body are written as one flush; Nagle would otherwise delay
+            // the small envelope. A socket option failure is not a safety signal, so ignore it.
+            runCatching { client.tcpNoDelay = true }
             if (!permits.tryAcquire()) {
                 runCatching { client.close() }
                 continue
@@ -103,8 +107,11 @@ class LocalHttpServer(
     internal fun handle(socket: Socket) {
         socket.use { client ->
             client.soTimeout = READ_TIMEOUT_MS
+            // One buffered stream for the whole request: the header lines and the body must be
+            // read through the same buffer, or bytes already pulled into it would be lost.
+            val input = BufferedInputStream(client.getInputStream())
             val response = try {
-                val request = HttpParser.parse(client.getInputStream())
+                val request = HttpParser.parse(input)
                 runBlocking { router.route(request) }
             } catch (error: HttpParseException) {
                 errorResponse(error.status, "HTTP_PARSE_ERROR", error.message.orEmpty())

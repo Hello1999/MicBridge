@@ -659,7 +659,7 @@ class MicCoordinator(
                 openValidUntilElapsed,
                 persistent = activeLeasePersistent,
             )
-            val opened = try {
+            val attempt = try {
                 leaseSafety.withMutationLock {
                     val lifecycleAllowedAtDispatch = openAllowed()
                     val generationAllowedAtDispatch =
@@ -672,18 +672,23 @@ class MicCoordinator(
                         !calibrationAllowedAtDispatch ||
                         !hasValidActiveLease()
                     ) {
-                        controlFailure(
-                            MicAccessState.OPEN,
-                            if (!lifecycleAllowedAtDispatch) {
-                                "OPEN_LIFECYCLE_DISABLED"
-                            } else if (!generationAllowedAtDispatch) {
-                                "REMOTE_GENERATION_REVOKED"
-                            } else if (!calibrationAllowedAtDispatch) {
-                                "ACOUSTIC_CALIBRATION_REVOKED"
-                            } else {
-                                "LEASE_INVALID_BEFORE_OPEN"
-                            },
-                            "OPEN 指令排队期间授权窗口已关闭",
+                        // The authorization window closed before `controller.open` ran, so no
+                        // mutation happened and no Root guard proof is claimed for this attempt.
+                        GuardedOpen(
+                            control = controlFailure(
+                                MicAccessState.OPEN,
+                                if (!lifecycleAllowedAtDispatch) {
+                                    "OPEN_LIFECYCLE_DISABLED"
+                                } else if (!generationAllowedAtDispatch) {
+                                    "REMOTE_GENERATION_REVOKED"
+                                } else if (!calibrationAllowedAtDispatch) {
+                                    "ACOUSTIC_CALIBRATION_REVOKED"
+                                } else {
+                                    "LEASE_INVALID_BEFORE_OPEN"
+                                },
+                                "OPEN 指令排队期间授权窗口已关闭",
+                            ),
+                            rootGuardHealthy = false,
                         )
                     } else {
                         val candidate = controller.open(frozenTarget, authorization)
@@ -693,6 +698,9 @@ class MicCoordinator(
                         val calibrationAllowedAfterOpen =
                             !requireCalibration || calibrationValid()
                         val leaseAllowedAfterOpen = hasValidActiveLease()
+                        // The only Root shell round trip of this OPEN attempt. It already runs
+                        // after the mutation and inside the same mutation gate, so the commit
+                        // check below reuses it instead of paying a second 100–200 ms `su`.
                         val rootGuardAllowedAfterOpen =
                             activeLeaseRootWatchdogArmed != true ||
                                 leaseSafety.verifyActiveGuard(requestId)
@@ -709,36 +717,46 @@ class MicCoordinator(
                             // synchronously been rolled back. A delivered alarm cannot BLOCK
                             // first and then be undone by this in-flight OPEN.
                             val rollback = controller.block(frozenTarget)
-                            ControlResult(
-                                requested = MicAccessState.OPEN,
-                                observed = rollback.observed,
-                                controlReadback = false,
-                                durationMs = candidate.durationMs + rollback.durationMs,
-                                errorCode = if (!lifecycleAllowedAfterOpen) {
-                                    "OPEN_LIFECYCLE_DISABLED"
-                                } else if (!generationAllowedAfterOpen) {
-                                    "REMOTE_GENERATION_REVOKED"
-                                } else if (!calibrationAllowedAfterOpen) {
-                                    "ACOUSTIC_CALIBRATION_REVOKED"
-                                } else if (!rootGuardAllowedAfterOpen) {
-                                    "LEASE_GUARD_UNHEALTHY"
-                                } else {
-                                    "LEASE_EXPIRED_DURING_OPEN"
-                                },
-                                errorMessage = "OPEN 在授权失效后才完成；已在同一安全闸内回滚",
+                            GuardedOpen(
+                                control = ControlResult(
+                                    requested = MicAccessState.OPEN,
+                                    observed = rollback.observed,
+                                    controlReadback = false,
+                                    durationMs = candidate.durationMs + rollback.durationMs,
+                                    errorCode = if (!lifecycleAllowedAfterOpen) {
+                                        "OPEN_LIFECYCLE_DISABLED"
+                                    } else if (!generationAllowedAfterOpen) {
+                                        "REMOTE_GENERATION_REVOKED"
+                                    } else if (!calibrationAllowedAfterOpen) {
+                                        "ACOUSTIC_CALIBRATION_REVOKED"
+                                    } else if (!rootGuardAllowedAfterOpen) {
+                                        "LEASE_GUARD_UNHEALTHY"
+                                    } else {
+                                        "LEASE_EXPIRED_DURING_OPEN"
+                                    },
+                                    errorMessage = "OPEN 在授权失效后才完成；已在同一安全闸内回滚",
+                                ),
+                                rootGuardHealthy = rootGuardAllowedAfterOpen,
                             )
                         } else {
-                            candidate
+                            GuardedOpen(
+                                control = candidate,
+                                rootGuardHealthy = rootGuardAllowedAfterOpen,
+                            )
                         }
                     }
                 }
             } catch (error: Exception) {
-                controlFailure(
-                    MicAccessState.OPEN,
-                    "OPEN_GUARD_EXCEPTION",
-                    "OPEN 安全闸异常：${error.javaClass.simpleName}",
+                GuardedOpen(
+                    control = controlFailure(
+                        MicAccessState.OPEN,
+                        "OPEN_GUARD_EXCEPTION",
+                        "OPEN 安全闸异常：${error.javaClass.simpleName}",
+                    ),
+                    rootGuardHealthy = false,
                 )
             }
+            val opened = attempt.control
             if (
                 opened.errorCode != null ||
                 !opened.controlReadback ||
@@ -761,9 +779,14 @@ class MicCoordinator(
             val deadlineStillValid = hasValidActiveLease()
             val lifecycleStillAllowed = openAllowed()
             val calibrationAtCommit = !requireCalibration || calibrationValid()
-            val rootGuardStillHealthy =
-                activeLeaseRootWatchdogArmed != true ||
-                    leaseSafety.verifyActiveGuard(requestId)
+            // Reuses the in-lock proof taken after `controller.open` instead of a second Root
+            // shell round trip. Nothing between the two points can invalidate the guard without
+            // the cheap in-memory checks above already rejecting the commit: `activeLease*` is
+            // only mutated under this coordinator's held mutex, the lease's monotonic
+            // stop-OPEN instant is exactly what `hasValidActiveLease()` re-reads, and any later
+            // externally visible OPEN (status, replay, assertion) plus the ~250 ms periodic
+            // `activeRootGuardHealthy()` poll still re-prove the PID-bound guard.
+            val rootGuardStillHealthy = attempt.rootGuardHealthy
             if (
                 !lifecycleStillAllowed ||
                 !generationStillAllowed ||
@@ -1205,11 +1228,7 @@ class MicCoordinator(
             if (deadline <= elapsedRealtimeMs()) return false
             if (activeLeaseExactAlarmArmed != true) return false
         }
-        val rootWatchdogRequired = target.controllerId in setOf(
-            com.jack.micbridge.data.SettingsRepository.CONTROLLER_AUDIO_MANAGER,
-            com.jack.micbridge.data.SettingsRepository.CONTROLLER_APP_OPS,
-            com.jack.micbridge.data.SettingsRepository.CONTROLLER_SENSOR_PRIVACY,
-        )
+        val rootWatchdogRequired = target.controllerId in ROOT_WATCHDOG_CONTROLLERS
         return !rootWatchdogRequired || activeLeaseRootWatchdogArmed == true
     }
 
@@ -1224,11 +1243,7 @@ class MicCoordinator(
     private suspend fun hasHealthyActiveLease(): Boolean {
         if (!hasValidActiveLease()) return false
         val target = activeLeaseTarget ?: return false
-        val rootWatchdogRequired = target.controllerId in setOf(
-            com.jack.micbridge.data.SettingsRepository.CONTROLLER_AUDIO_MANAGER,
-            com.jack.micbridge.data.SettingsRepository.CONTROLLER_APP_OPS,
-            com.jack.micbridge.data.SettingsRepository.CONTROLLER_SENSOR_PRIVACY,
-        )
+        val rootWatchdogRequired = target.controllerId in ROOT_WATCHDOG_CONTROLLERS
         if (!rootWatchdogRequired) return true
         val requestId = activeLeaseRequestId ?: return false
         return runCatching { leaseSafety.verifyActiveGuard(requestId) }.getOrDefault(false)
@@ -1268,6 +1283,19 @@ class MicCoordinator(
         errorMessage = message,
     )
 
+    /**
+     * One guarded OPEN attempt: its [ControlResult] plus the single PID-bound Root guard proof
+     * taken inside the same mutation lock, immediately after `controller.open`.
+     *
+     * [rootGuardHealthy] is `false` whenever no proof was taken (the authorization window closed
+     * before the mutation, or the guard gate threw). Those attempts always carry an `errorCode`
+     * and therefore fail closed before the commit check ever reads this flag.
+     */
+    private data class GuardedOpen(
+        val control: ControlResult,
+        val rootGuardHealthy: Boolean,
+    )
+
     private data class SafetyObservation(
         val observed: MicAccessState,
         val readback: Boolean,
@@ -1279,5 +1307,16 @@ class MicCoordinator(
         const val ENDPOINT_TOGGLE = "/v1/mic/toggle"
         const val ENDPOINT_OPEN = "/v1/mic/open"
         const val ENDPOINT_BLOCK = "/v1/mic/block"
+
+        /**
+         * Controllers whose OPEN is only valid while an independent Root watchdog protects it.
+         * The membership test runs on every lease validity/health check, so the set is built
+         * once instead of per call. Contents are identical to the previous inline `setOf`.
+         */
+        private val ROOT_WATCHDOG_CONTROLLERS = setOf(
+            com.jack.micbridge.data.SettingsRepository.CONTROLLER_AUDIO_MANAGER,
+            com.jack.micbridge.data.SettingsRepository.CONTROLLER_APP_OPS,
+            com.jack.micbridge.data.SettingsRepository.CONTROLLER_SENSOR_PRIVACY,
+        )
     }
 }

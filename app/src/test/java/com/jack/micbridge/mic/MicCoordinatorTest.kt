@@ -248,6 +248,53 @@ class MicCoordinatorTest {
         assertEquals(MicAccessState.BLOCKED, assertion.micAccess)
     }
 
+    /**
+     * `verifyActiveGuard` is a Root shell round trip (~100–200 ms on device). One guarded OPEN
+     * needs exactly one, taken inside the mutation lock right after `controller.open`; the
+     * post-lock commit check reuses that proof instead of paying for a second one.
+     */
+    @Test
+    fun `successful remote open verifies the Root guard exactly once`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = true
+
+        val opened = fixture.coordinator.execute(
+            MicCoordinator.ENDPOINT_TOGGLE,
+            "request-guard-once-01",
+            remoteGeneration = 7L,
+        )
+
+        assertTrue(opened.ok)
+        assertEquals(MicAccessState.OPEN, opened.micAccess)
+        assertEquals(true, opened.leaseRootWatchdogArmed)
+        assertEquals(1, fixture.lease.guardVerificationCount)
+    }
+
+    /** The single in-lock proof still fails the OPEN closed, with the same code and rollback. */
+    @Test
+    fun `unhealthy Root guard after open rolls back inside the mutation gate`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = true
+        fixture.controller.onOpen = { fixture.lease.guardHealthy = false }
+
+        val result = fixture.coordinator.execute(
+            MicCoordinator.ENDPOINT_TOGGLE,
+            "request-guard-unhealthy-01",
+            remoteGeneration = 7L,
+        )
+
+        assertFalse(result.ok)
+        assertEquals("LEASE_GUARD_UNHEALTHY", result.errorCode)
+        assertEquals(MicAccessState.BLOCKED, result.micAccess)
+        assertEquals(1, fixture.lease.guardVerificationCount)
+    }
+
     @Test
     fun `concurrent same id is serialized`() = runTest {
         val fixture = Fixture(initialState = MicAccessState.BLOCKED)

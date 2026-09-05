@@ -17,6 +17,13 @@ class SettingsRepository(context: Context) {
     private val packageManager = context.packageManager
     private val directBootSettings = DirectBootSettings(context)
 
+    /**
+     * Memoized [currentAcousticCalibrationIdentity]. Both fields are only read and written while
+     * holding [CALIBRATION_IDENTITY_LOCK], which also serializes every mutating path here.
+     */
+    private var calibrationIdentityCache: AcousticCalibrationIdentity? = null
+    private var calibrationIdentityCachedAtNanos: Long? = null
+
     init {
         // root_appops was available only during development. AppOps exposes the resulting
         // value but not its last writer, so an identical external `ignore` written during an
@@ -30,6 +37,7 @@ class SettingsRepository(context: Context) {
                     .putString(KEY_CONTROLLER, CONTROLLER_SENSOR_PRIVACY)
                     .commit(),
             ) { "不安全的旧控制器迁移失败" }
+            invalidateCalibrationIdentityCache()
         }
         mirrorDirectBootController()
     }
@@ -68,6 +76,7 @@ class SettingsRepository(context: Context) {
                 check(editor.commit()) {
                     "控制器设置持久化失败"
                 }
+                invalidateCalibrationIdentityCache()
                 check(mirrorDirectBootController()) { "Direct Boot 控制器镜像失败" }
             }
         }
@@ -93,6 +102,7 @@ class SettingsRepository(context: Context) {
                 check(editor.commit()) {
                     "目标包设置持久化失败"
                 }
+                invalidateCalibrationIdentityCache()
                 check(mirrorDirectBootController()) { "Direct Boot 目标镜像失败" }
             }
         }
@@ -111,6 +121,7 @@ class SettingsRepository(context: Context) {
                 }
                 else putString(KEY_ORIGINAL_APPOPS_MODE, value)
             }.commit().also { check(it) { "AppOps 原态设置持久化失败" } }
+            invalidateCalibrationIdentityCache()
             check(mirrorDirectBootController()) { "Direct Boot AppOps 镜像失败" }
         }
 
@@ -136,6 +147,7 @@ class SettingsRepository(context: Context) {
             .remove(KEY_OWNED_APPOPS_IGNORE_PACKAGE)
             .remove(KEY_OWNED_APPOPS_IGNORE_USER)
             .commit()
+        invalidateCalibrationIdentityCache()
         return saved && mirrorDirectBootController()
     }
 
@@ -152,6 +164,7 @@ class SettingsRepository(context: Context) {
             .putString(KEY_OWNED_APPOPS_IGNORE_PACKAGE, packageName)
             .putInt(KEY_OWNED_APPOPS_IGNORE_USER, userId)
             .commit()
+            .also { invalidateCalibrationIdentityCache() }
     }
 
     fun ownsAppOpsIgnore(packageName: String, userId: Int): Boolean {
@@ -169,6 +182,7 @@ class SettingsRepository(context: Context) {
         .remove(KEY_OWNED_APPOPS_IGNORE_PACKAGE)
         .remove(KEY_OWNED_APPOPS_IGNORE_USER)
         .commit()
+        .also { invalidateCalibrationIdentityCache() }
 
     /**
      * AppOps must never become the pre-unlock blocker until its exact restorable package mode
@@ -230,6 +244,9 @@ class SettingsRepository(context: Context) {
             .putString(KEY_TOKEN, next)
             .putInt(KEY_TOKEN_GENERATION, tokenGeneration + 1)
             .commit()) { "令牌轮换持久化失败" }
+        // The token is not part of the identity; invalidating anyway keeps "every mutating path
+        // drops the memo" an invariant that cannot rot as this class grows.
+        invalidateCalibrationIdentityCache()
         return next
     }
 
@@ -242,6 +259,10 @@ class SettingsRepository(context: Context) {
     fun markAcousticCalibrationPassed(
         testedIdentity: AcousticCalibrationIdentity,
     ): Boolean = synchronized(CALIBRATION_IDENTITY_LOCK) {
+        // A calibration commit is rare and must compare against a capture taken now, never
+        // against the memo: the 250 ms window is acceptable on the toggle path but not for
+        // the one decision that creates a durable proof.
+        invalidateCalibrationIdentityCache()
         if (currentAcousticCalibrationIdentity() != testedIdentity) return@synchronized false
         preferences.edit()
             .putLong(
@@ -269,6 +290,7 @@ class SettingsRepository(context: Context) {
             .putInt(KEY_CALIBRATED_ANDROID_USER_ID, testedIdentity.androidUserId)
             .putLong(KEY_CALIBRATED_AT, System.currentTimeMillis())
             .commit()
+            .also { invalidateCalibrationIdentityCache() }
     }
 
     fun clearCalibration() = synchronized(CALIBRATION_IDENTITY_LOCK) {
@@ -287,6 +309,7 @@ class SettingsRepository(context: Context) {
             .remove(KEY_CALIBRATED_AT)
             .commit()
             .also { check(it) { "声学校准撤销持久化失败" } }
+        invalidateCalibrationIdentityCache()
         Unit
     }
 
@@ -298,11 +321,39 @@ class SettingsRepository(context: Context) {
     fun calibratedAtEpochMs(): Long? =
         preferences.getLong(KEY_CALIBRATED_AT, 0L).takeIf { it > 0L }
 
-    /** Captures one complete, immutable identity for calibration step/commit comparisons. */
+    /**
+     * Captures one complete, immutable identity for calibration step/commit comparisons.
+     *
+     * Every capture costs a `PackageManager` Binder round trip plus a SHA-256 over the signing
+     * certificate, and one guarded OPEN transition asks for it roughly six times (entry snapshot,
+     * pre-dispatch, post-open, commit, and once each inside the snapshot/operation builders).
+     * The result is therefore memoized for [CALIBRATION_IDENTITY_CACHE_MS] under the same
+     * [CALIBRATION_IDENTITY_LOCK] that serializes every mutation of this class, and every
+     * mutating path invalidates it eagerly via [invalidateCalibrationIdentityCache].
+     *
+     * Trade-off, stated precisely: a change that this class cannot observe — a target-package
+     * install/update, a permission revocation, or an Android build change — is seen at most
+     * 250 ms late. That is observationally identical to the same change landing 250 ms earlier,
+     * which the design must already tolerate, and it creates no new failure class:
+     *  - calibration validity is never part of the continuous `openAllowed` gate; it is only
+     *    ever evaluated at transition boundaries, each of which re-reads it,
+     *  - a stale-but-fresher-than-250 ms identity can only ever equal the value this call would
+     *    have returned 250 ms ago, so it can neither invent a match nor suppress a real
+     *    mismatch for longer than that window,
+     *  - the persisted proof compared against it ([storedAcousticCalibrationIdentity]) is not
+     *    cached, so any commit or clear takes effect immediately.
+     */
     @Suppress("DEPRECATION")
     fun currentAcousticCalibrationIdentity(): AcousticCalibrationIdentity? =
         synchronized(CALIBRATION_IDENTITY_LOCK) {
-            runCatching {
+            val cachedAt = calibrationIdentityCachedAtNanos
+            if (
+                cachedAt != null &&
+                System.nanoTime() - cachedAt < CALIBRATION_IDENTITY_CACHE_MS * 1_000_000L
+            ) {
+                return@synchronized calibrationIdentityCache
+            }
+            val computed = runCatching {
                 val selectedGeneration = calibrationSettingsGeneration
                 val selectedController = controllerId
                 val selectedPackage = targetPackage
@@ -324,7 +375,22 @@ class SettingsRepository(context: Context) {
                     androidUserId = appUserId(),
                 )
             }.getOrNull()
+            calibrationIdentityCache = computed
+            calibrationIdentityCachedAtNanos = System.nanoTime()
+            computed
         }
+
+    /**
+     * Drops the memoized identity so the next capture is fresh. Called from every path in this
+     * class that can change any field the identity is derived from; a superfluous call is always
+     * safe because it only forces one extra recomputation.
+     */
+    private fun invalidateCalibrationIdentityCache() {
+        synchronized(CALIBRATION_IDENTITY_LOCK) {
+            calibrationIdentityCache = null
+            calibrationIdentityCachedAtNanos = null
+        }
+    }
 
     @Suppress("DEPRECATION")
     private fun packageInfoWithSigningCertificates(packageName: String): PackageInfo =
@@ -464,5 +530,12 @@ class SettingsRepository(context: Context) {
         private const val PER_USER_RANGE = 100_000
         private val RESTORABLE_APPOPS_MODES = setOf("allow", "default")
         private val CALIBRATION_IDENTITY_LOCK = Any()
+
+        /**
+         * Maximum age of a memoized acoustic-calibration identity. Bounds how late an
+         * externally caused identity change (package update, permission change, Android build
+         * change) can be observed; see [currentAcousticCalibrationIdentity].
+         */
+        private const val CALIBRATION_IDENTITY_CACHE_MS = 250L
     }
 }

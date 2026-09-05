@@ -47,6 +47,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -58,12 +59,15 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.jack.micbridge.data.BridgeSnapshot
+import com.jack.micbridge.data.AuditEntry
 import com.jack.micbridge.data.AuditLogRepository
 import com.jack.micbridge.data.MicAccessState
 import com.jack.micbridge.data.SettingsRepository
 import com.jack.micbridge.service.BridgeForegroundService
 import com.jack.micbridge.service.ServiceRuntime
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.time.Instant
 
 class MainActivity : ComponentActivity() {
@@ -407,8 +411,23 @@ private fun MicBridgeScreen() {
                         calibrationBlockedConfirmed &&
                         calibrationOpenConfirmed,
                 ) { Text("记录校准通过") }
+                // This check queries PackageManager and hashes the target's signing certificate.
+                // Running it inside composition blocked the main thread on every recomposition;
+                // it still reads the stored settings, so it stays meaningful while the service
+                // is stopped. `null` means the first result has not arrived yet.
+                val calibrationValid by produceState<Boolean?>(
+                    initialValue = null,
+                    refreshKey,
+                    snapshot.observedAtEpochMs,
+                ) {
+                    value = withContext(Dispatchers.IO) { settings.isAcousticCalibrationValid() }
+                }
                 Text(
-                    "当前声学校准：${if (settings.isAcousticCalibrationValid()) "有效" else "未完成或已失效"}",
+                    "当前声学校准：" + when (calibrationValid) {
+                        null -> "检查中…"
+                        true -> "有效"
+                        else -> "未完成或已失效"
+                    },
                     fontWeight = FontWeight.Bold,
                 )
             }
@@ -501,8 +520,13 @@ private fun MicBridgeScreen() {
                     },
                     enabled = snapshot.serviceRunning,
                 ) { Text("先屏蔽并安全重扫网络/状态") }
-                val recentAudit = remember(refreshKey, snapshot.observedAtEpochMs) {
-                    auditLog.recent(20)
+                // SQLite read off the main thread; it still refreshes on exactly the same keys.
+                val recentAudit by produceState(
+                    initialValue = emptyList<AuditEntry>(),
+                    refreshKey,
+                    snapshot.observedAtEpochMs,
+                ) {
+                    value = withContext(Dispatchers.IO) { auditLog.recent(20) }
                 }
                 Text("最近审计记录（不含令牌/音频）", fontWeight = FontWeight.Bold)
                 if (recentAudit.isEmpty()) {

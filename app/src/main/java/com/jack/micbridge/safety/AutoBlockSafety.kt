@@ -191,15 +191,20 @@ class AutoBlockSafety(
     }
 
     override suspend fun cancel() = mutationGate.withLock {
-        check(ownsRootWorkspace()) {
-            "Current Android user does not own the Root safety workspace"
-        }
         val active = leaseStore.load()
         if (active != null && active.target.controllerId in ROOT_WATCHDOG_CONTROLLERS) {
             val marker =
                 "cancel-${active.requestId}-${System.currentTimeMillis()}-${SecureRandom().nextInt().toUInt()}"
+            // The revoke script proves workspace ownership under the same flock it uses to block
+            // and replace the marker, so a separate ownership round trip would only add latency
+            // before an OPEN can be closed. A foreign owner fails this check inside the script
+            // and therefore still surfaces through the same fail-closed `check` below.
             check(revokeRootLeaseAfterVerifiedBlock(active, marker)) {
                 "Root lease could not be atomically blocked and revoked"
+            }
+        } else {
+            check(ownsRootWorkspace()) {
+                "Current Android user does not own the Root safety workspace"
             }
         }
         // This method is called only after a fresh BLOCKED readback for the same persisted
@@ -292,14 +297,16 @@ class AutoBlockSafety(
      * replacement marker and cannot reverse it.
      */
     suspend fun emergencyFenceAndBlock(): Boolean {
-        if (!ownsRootWorkspace()) return false
         val active = leaseStore.load()
         if (active != null && active.target.controllerId in ROOT_WATCHDOG_CONTROLLERS) {
             val marker =
                 "cancel-${active.requestId}-destroy-${System.currentTimeMillis()}-" +
                     SecureRandom().nextInt().toUInt()
+            // Ownership is asserted inside the revoke script, under the same flock as the block
+            // and marker replacement, so this destruction path needs one root round trip.
             return revokeRootLeaseAfterVerifiedBlock(active, marker)
         }
+        if (!ownsRootWorkspace()) return false
         return DirectBootFailsafeBlocker.block(context.applicationContext)
     }
 
@@ -662,111 +669,18 @@ class AutoBlockSafety(
             watcher.toByteArray(Charsets.UTF_8),
             Base64.NO_WRAP,
         )
-        val prerequisite = RootFailSafeScripts.prerequisiteCheck(controllerId)
-            ?: return@withContext false
-        val command = """
-            set -e
-            mkdir -p $ROOT_DIR
-            command -v base64 >/dev/null 2>&1
-            command -v flock >/dev/null 2>&1
-            command -v timeout >/dev/null 2>&1
-            command -v nohup >/dev/null 2>&1
-            command -v awk >/dev/null 2>&1
-            command -v grep >/dev/null 2>&1
-            $prerequisite
-            exec 0>>$ROOT_LEASE_LOCK_FILE
-            flock -x 0
-            test "${'$'}(cat $ROOT_OWNER_FILE 2>/dev/null)" = ${RootShell.quote(android.os.Process.myUid().toString())}
-            SETUP_LOCKED=1
-            LEASE_TMP=${RootShell.quote("$LEASE_FILE.$requestId.tmp")}
-            META_TMP=${RootShell.quote("$LEASE_META_FILE.$requestId.tmp")}
-            WATCH_TMP=${RootShell.quote("$watcherPath.tmp")}
-            WATCH_PID_FILE=${RootShell.quote("$ROOT_DIR/watch-$requestId.pid")}
-            WATCH_PID_TMP=${RootShell.quote("$ROOT_DIR/watch-$requestId.pid.tmp")}
-            cleanup_setup() {
-              rm -f "${'$'}LEASE_TMP" "${'$'}META_TMP" "${'$'}WATCH_TMP" "${'$'}WATCH_PID_TMP"
-              if [ "${'$'}SETUP_LOCKED" = 1 ]; then
-                flock -u 0 || true
-                SETUP_LOCKED=0
-              fi
-            }
-            trap cleanup_setup EXIT
-            trap 'exit 1' HUP INT TERM
-            APP_PID=${RootShell.quote(android.os.Process.myPid().toString())}
-            APP_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}APP_PID/stat" 2>/dev/null)
-            APP_STATE=${'$'}{APP_PROC%%\|*}
-            APP_START=${'$'}{APP_PROC#*\|}
-            case "${'$'}APP_STATE" in R|S) ;; *) exit 1;; esac
-            case "${'$'}APP_START" in ''|*[!0-9]*) exit 1;; esac
-            GENERATION=${'$'}(cat $ROOT_BOOT_GENERATION_FILE 2>/dev/null)
-            case "${'$'}GENERATION" in g-[0-9a-f][0-9a-f]*) ;; *) exit 1;; esac
-            SETUP_NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
-            case "${'$'}SETUP_NOW_MS" in ''|*[!0-9]*) exit 1;; esac
-            ARM_BY_MS=${'$'}((SETUP_NOW_MS + $ROOT_ARM_GRACE_MS))
-            printf %s ${RootShell.quote(encoded)} | base64 -d > "${'$'}WATCH_TMP"
-            chmod 700 "${'$'}WATCH_TMP"
-            mv -f "${'$'}WATCH_TMP" ${RootShell.quote(watcherPath)}
-            rm -f ${RootShell.quote(watcherStatusPath)} "${'$'}WATCH_PID_FILE"
-            nohup sh ${RootShell.quote(watcherPath)} >/dev/null 2>&1 &
-            WATCH_PID=${'$'}!
-            if ! kill -0 "${'$'}WATCH_PID" 2>/dev/null; then
-              exit 1
-            fi
-            printf %s "${'$'}WATCH_PID" > "${'$'}WATCH_PID_TMP"
-            mv -f "${'$'}WATCH_PID_TMP" "${'$'}WATCH_PID_FILE"
-            printf '%s|%s|%s|%s|%s|%s|%s\n' \
-              ${RootShell.quote(requestId)} \
-              ${RootShell.quote(openValidUntilElapsedRealtimeMs.toString())} \
-              ${RootShell.quote(hardDeadlineElapsedRealtimeMs.toString())} \
-              "${'$'}APP_PID" "${'$'}APP_START" "${'$'}GENERATION" "${'$'}ARM_BY_MS" > "${'$'}META_TMP"
-            mv -f "${'$'}META_TMP" $LEASE_META_FILE
-            # Publish the active request last. The supervisor can therefore never observe an
-            # active lease without its immutable script, exact child PID, app identity and
-            # monotonic deadlines already committed under the same flock.
-            printf %s ${RootShell.quote(requestId)} > "${'$'}LEASE_TMP"
-            mv -f "${'$'}LEASE_TMP" $LEASE_FILE
-            flock -u 0
-            SETUP_LOCKED=0
-            trap - EXIT HUP INT TERM
-            i=0
-            while [ ${'$'}i -lt $ROOT_ARM_STATUS_POLLS ]; do
-              STATUS=${'$'}(cat ${RootShell.quote(watcherStatusPath)} 2>/dev/null || true)
-              if [ "${'$'}STATUS" = "armed-${RootShell.requireOpaqueId(requestId)}-${'$'}WATCH_PID" ]; then
-                if ! kill -0 "${'$'}WATCH_PID" 2>/dev/null; then
-                  exit 1
-                fi
-                NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
-                case "${'$'}NOW_MS" in ''|*[!0-9]*) exit 1;; esac
-                if [ ${if (persistent) "1" else "0"} != 1 ] && [ "${'$'}NOW_MS" -ge ${RootShell.quote(openValidUntilElapsedRealtimeMs.toString())} ]; then
-                  exit 1
-                fi
-                sleep 0.05
-                NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
-                case "${'$'}NOW_MS" in ''|*[!0-9]*) exit 1;; esac
-                if [ ${if (persistent) "1" else "0"} != 1 ] && [ "${'$'}NOW_MS" -ge ${RootShell.quote(openValidUntilElapsedRealtimeMs.toString())} ]; then
-                  exit 1
-                fi
-                kill -0 "${'$'}WATCH_PID" 2>/dev/null
-                exit 0
-              fi
-              case "${'$'}STATUS" in
-                deadline-*)
-                  exit 1
-                  ;;
-                wake-lock-*|marker-*|prerequisite-*|preflight-*|lock-*)
-                  kill "${'$'}WATCH_PID" 2>/dev/null || true
-                  exit 1
-                  ;;
-              esac
-              if ! kill -0 "${'$'}WATCH_PID" 2>/dev/null; then
-                exit 1
-              fi
-              i=${'$'}((i + 1))
-              sleep 0.05
-            done
-            kill "${'$'}WATCH_PID" 2>/dev/null || true
-            exit 1
-        """.trimIndent()
+        val command = RootFailSafeScripts.armWatcher(
+            controllerId = controllerId,
+            requestId = requestId,
+            ownerUid = android.os.Process.myUid().toString(),
+            appPid = android.os.Process.myPid().toString(),
+            watcherPath = watcherPath,
+            watcherStatusPath = watcherStatusPath,
+            encodedWatcher = encoded,
+            openValidUntilElapsedRealtimeMs = openValidUntilElapsedRealtimeMs,
+            hardDeadlineElapsedRealtimeMs = hardDeadlineElapsedRealtimeMs,
+            persistent = persistent,
+        ) ?: return@withContext false
         rootShell.execute(command, timeoutMs = ROOT_ARM_TIMEOUT_MS).succeeded
     }
 
@@ -794,6 +708,7 @@ class AutoBlockSafety(
             userId = active.target.userId,
             expectedRequestId = active.requestId,
             replacementMarker = marker,
+            ownerUid = android.os.Process.myUid().toString(),
         ) ?: return false
         return rootShell.execute(command, timeoutMs = ROOT_ARM_TIMEOUT_MS).succeeded
     }
@@ -862,8 +777,6 @@ class AutoBlockSafety(
         private const val GLOBAL_MIC_TARGET = "android-global-microphone"
         private const val ROOT_DEPLOY_TIMEOUT_MS = 8_000L
         private const val ROOT_ARM_TIMEOUT_MS = 6_000L
-        private const val ROOT_ARM_STATUS_POLLS = 40
-        private const val ROOT_ARM_GRACE_MS = 3_000L
         private const val ROOT_DEPLOY_STATUS_POLLS = 100
         private const val ROOT_BLOCK_RETRY_BUDGET_MS = 10_000L
         private const val HEX = "0123456789abcdef"
@@ -913,8 +826,15 @@ internal object RootFailSafeScripts {
     private const val LEASE_FILE = "$ROOT_DIR/lease"
     private const val LEASE_META_FILE = "$ROOT_DIR/lease-meta"
     private const val LOCK_FILE = "$ROOT_DIR/lease.lock"
+    private const val OWNER_FILE = "$ROOT_DIR/owner-uid"
     private const val GENERATION_FILE = "$ROOT_DIR/boot-current"
     private const val BOOT_STATUS_FILE = "$ROOT_DIR/boot-status"
+    // Arm-handshake budget: 150 polls x (10 ms sleep + a `cat` fork) stays at or below the
+    // previous 40 x 50 ms (~2 s) and therefore below ARM_GRACE_MS, while a watcher that
+    // publishes `armed` quickly is observed in ~10 ms instead of ~50 ms.
+    const val ARM_STATUS_POLLS = 150
+    private const val ARM_STATUS_POLL_SECONDS = "0.01"
+    private const val ARM_GRACE_MS = 3_000L
     private const val ROOT_BLOCK_RETRY_DELAY_SECONDS = "0.15"
     private const val ROOT_BOOT_RETRY_WINDOW_MS = 180_000L
     private const val ROOT_BOOT_CLOCK_FAILURE_ATTEMPTS = 180
@@ -956,6 +876,7 @@ internal object RootFailSafeScripts {
         userId: Int,
         expectedRequestId: String,
         replacementMarker: String,
+        ownerUid: String,
     ): String? {
         if (userId < 0) return null
         val blockAttempt = blockAttempt(controllerId) ?: return null
@@ -987,6 +908,10 @@ internal object RootFailSafeScripts {
             exec 0>>"${'$'}LOCK_FILE"
             flock -x 0
             REVOKE_LOCKED=1
+            # Workspace ownership is proven inside the same flock that blocks and replaces the
+            # marker, so a foreign Android profile can never revoke the owner's live lease. This
+            # replaces the caller's separate ownership round trip without weakening it.
+            test "${'$'}(cat $OWNER_FILE 2>/dev/null)" = ${RootShell.quote(ownerUid)} || exit 78
             CURRENT_REQUEST=
             if [ -f "${'$'}LEASE_FILE" ]; then
               CURRENT_REQUEST=${'$'}(cat "${'$'}LEASE_FILE")
@@ -1005,6 +930,147 @@ internal object RootFailSafeScripts {
             flock -u 0
             REVOKE_LOCKED=0
             trap - EXIT HUP INT TERM
+        """.trimIndent()
+    }
+
+    /**
+     * Installs the immutable per-lease watcher, publishes the lease under the shared flock and
+     * completes the arm handshake. Kept next to the other generated scripts so the ordering
+     * guarantees (watcher script, child PID and meta committed before the active request marker)
+     * and the arm-status polling contract stay testable on the host JVM.
+     */
+    fun armWatcher(
+        controllerId: String,
+        requestId: String,
+        ownerUid: String,
+        appPid: String,
+        watcherPath: String,
+        watcherStatusPath: String,
+        encodedWatcher: String,
+        openValidUntilElapsedRealtimeMs: Long,
+        hardDeadlineElapsedRealtimeMs: Long,
+        persistent: Boolean,
+    ): String? {
+        val prerequisite = prerequisiteCheck(controllerId) ?: return null
+        val safeRequestId = RootShell.requireOpaqueId(requestId)
+        val openValidUntil = RootShell.quote(openValidUntilElapsedRealtimeMs.toString())
+        // A persistent lease has no timed deadline, so once the watcher publishes `armed` the
+        // only property left to prove is that the same child process is still alive. The extra
+        // settle-and-recheck below exists solely to re-test a timed deadline.
+        val armedConfirmation = (
+            if (persistent) {
+                """
+                    kill -0 "${'$'}WATCH_PID" 2>/dev/null
+                    exit 0
+                """
+            } else {
+                """
+                    if ! kill -0 "${'$'}WATCH_PID" 2>/dev/null; then
+                      exit 1
+                    fi
+                    NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
+                    case "${'$'}NOW_MS" in ''|*[!0-9]*) exit 1;; esac
+                    if [ 0 != 1 ] && [ "${'$'}NOW_MS" -ge $openValidUntil ]; then
+                      exit 1
+                    fi
+                    sleep 0.05
+                    NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
+                    case "${'$'}NOW_MS" in ''|*[!0-9]*) exit 1;; esac
+                    if [ 0 != 1 ] && [ "${'$'}NOW_MS" -ge $openValidUntil ]; then
+                      exit 1
+                    fi
+                    kill -0 "${'$'}WATCH_PID" 2>/dev/null
+                    exit 0
+                """
+            }
+            ).trimIndent().replace("\n", "\n                ")
+        return """
+            set -e
+            mkdir -p $ROOT_DIR
+            command -v base64 >/dev/null 2>&1
+            command -v flock >/dev/null 2>&1
+            command -v timeout >/dev/null 2>&1
+            command -v nohup >/dev/null 2>&1
+            command -v awk >/dev/null 2>&1
+            command -v grep >/dev/null 2>&1
+            $prerequisite
+            exec 0>>$LOCK_FILE
+            flock -x 0
+            test "${'$'}(cat $OWNER_FILE 2>/dev/null)" = ${RootShell.quote(ownerUid)}
+            SETUP_LOCKED=1
+            LEASE_TMP=${RootShell.quote("$LEASE_FILE.$safeRequestId.tmp")}
+            META_TMP=${RootShell.quote("$LEASE_META_FILE.$safeRequestId.tmp")}
+            WATCH_TMP=${RootShell.quote("$watcherPath.tmp")}
+            WATCH_PID_FILE=${RootShell.quote("$ROOT_DIR/watch-$safeRequestId.pid")}
+            WATCH_PID_TMP=${RootShell.quote("$ROOT_DIR/watch-$safeRequestId.pid.tmp")}
+            cleanup_setup() {
+              rm -f "${'$'}LEASE_TMP" "${'$'}META_TMP" "${'$'}WATCH_TMP" "${'$'}WATCH_PID_TMP"
+              if [ "${'$'}SETUP_LOCKED" = 1 ]; then
+                flock -u 0 || true
+                SETUP_LOCKED=0
+              fi
+            }
+            trap cleanup_setup EXIT
+            trap 'exit 1' HUP INT TERM
+            APP_PID=${RootShell.quote(appPid)}
+            APP_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}APP_PID/stat" 2>/dev/null)
+            APP_STATE=${'$'}{APP_PROC%%\|*}
+            APP_START=${'$'}{APP_PROC#*\|}
+            case "${'$'}APP_STATE" in R|S) ;; *) exit 1;; esac
+            case "${'$'}APP_START" in ''|*[!0-9]*) exit 1;; esac
+            GENERATION=${'$'}(cat $GENERATION_FILE 2>/dev/null)
+            case "${'$'}GENERATION" in g-[0-9a-f][0-9a-f]*) ;; *) exit 1;; esac
+            SETUP_NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
+            case "${'$'}SETUP_NOW_MS" in ''|*[!0-9]*) exit 1;; esac
+            ARM_BY_MS=${'$'}((SETUP_NOW_MS + $ARM_GRACE_MS))
+            printf %s ${RootShell.quote(encodedWatcher)} | base64 -d > "${'$'}WATCH_TMP"
+            chmod 700 "${'$'}WATCH_TMP"
+            mv -f "${'$'}WATCH_TMP" ${RootShell.quote(watcherPath)}
+            rm -f ${RootShell.quote(watcherStatusPath)} "${'$'}WATCH_PID_FILE"
+            nohup sh ${RootShell.quote(watcherPath)} >/dev/null 2>&1 &
+            WATCH_PID=${'$'}!
+            if ! kill -0 "${'$'}WATCH_PID" 2>/dev/null; then
+              exit 1
+            fi
+            printf %s "${'$'}WATCH_PID" > "${'$'}WATCH_PID_TMP"
+            mv -f "${'$'}WATCH_PID_TMP" "${'$'}WATCH_PID_FILE"
+            printf '%s|%s|%s|%s|%s|%s|%s\n' \
+              ${RootShell.quote(safeRequestId)} \
+              $openValidUntil \
+              ${RootShell.quote(hardDeadlineElapsedRealtimeMs.toString())} \
+              "${'$'}APP_PID" "${'$'}APP_START" "${'$'}GENERATION" "${'$'}ARM_BY_MS" > "${'$'}META_TMP"
+            mv -f "${'$'}META_TMP" $LEASE_META_FILE
+            # Publish the active request last. The supervisor can therefore never observe an
+            # active lease without its immutable script, exact child PID, app identity and
+            # monotonic deadlines already committed under the same flock.
+            printf %s ${RootShell.quote(safeRequestId)} > "${'$'}LEASE_TMP"
+            mv -f "${'$'}LEASE_TMP" $LEASE_FILE
+            flock -u 0
+            SETUP_LOCKED=0
+            trap - EXIT HUP INT TERM
+            i=0
+            while [ ${'$'}i -lt $ARM_STATUS_POLLS ]; do
+              STATUS=${'$'}(cat ${RootShell.quote(watcherStatusPath)} 2>/dev/null || true)
+              if [ "${'$'}STATUS" = "armed-$safeRequestId-${'$'}WATCH_PID" ]; then
+                $armedConfirmation
+              fi
+              case "${'$'}STATUS" in
+                deadline-*)
+                  exit 1
+                  ;;
+                wake-lock-*|marker-*|prerequisite-*|preflight-*|lock-*)
+                  kill "${'$'}WATCH_PID" 2>/dev/null || true
+                  exit 1
+                  ;;
+              esac
+              if ! kill -0 "${'$'}WATCH_PID" 2>/dev/null; then
+                exit 1
+              fi
+              i=${'$'}((i + 1))
+              sleep $ARM_STATUS_POLL_SECONDS
+            done
+            kill "${'$'}WATCH_PID" 2>/dev/null || true
+            exit 1
         """.trimIndent()
     }
 

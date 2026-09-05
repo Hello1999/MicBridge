@@ -1,5 +1,6 @@
 package com.jack.micbridge.server
 
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 
 object HttpParser {
@@ -121,15 +122,15 @@ object HttpParser {
 
     private fun readCrlfLine(input: InputStream, maxBytes: Int, deadlineNanos: Long): String? {
         if (maxBytes <= 0) throw HttpParseException(413, "Line too large")
-        val buffer = ArrayList<Byte>(minOf(maxBytes, 256))
+        val buffer = ByteArrayOutputStream(minOf(maxBytes, 256))
         var previousWasCr = false
-        while (buffer.size <= maxBytes) {
+        while (buffer.size() <= maxBytes) {
             if (System.nanoTime() > deadlineNanos) {
                 throw HttpParseException(408, "Request deadline exceeded")
             }
             val value = input.read()
             if (value == -1) {
-                if (buffer.isEmpty() && !previousWasCr) return null
+                if (buffer.size() == 0 && !previousWasCr) return null
                 throw HttpParseException(400, "Line must end with CRLF")
             }
             if (previousWasCr) {
@@ -142,13 +143,11 @@ object HttpParser {
                 previousWasCr = true
             } else {
                 if (value == '\n'.code) throw HttpParseException(400, "Bare LF is forbidden")
-                buffer += value.toByte()
+                buffer.write(value)
             }
         }
         throw HttpParseException(413, "Line too large")
     }
-
-    private fun List<Byte>.toByteArray(): ByteArray = ByteArray(size) { this[it] }
 
     private const val MAX_BODY_BYTES = 64L
     private val CONTENT_LENGTH_PATTERN = Regex("[0-9]+")

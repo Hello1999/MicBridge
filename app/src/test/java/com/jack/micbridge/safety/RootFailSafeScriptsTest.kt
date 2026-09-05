@@ -159,6 +159,7 @@ class RootFailSafeScriptsTest {
                 10,
                 "request-external-block",
                 "cancel-request-external-block-1-2",
+                "10123",
             )!!,
         )
 
@@ -201,6 +202,7 @@ class RootFailSafeScriptsTest {
                 10,
                 "request-multi-user",
                 "cancel-request-multi-user-1-2",
+                "10123",
             )!!,
         )
 
@@ -251,6 +253,7 @@ class RootFailSafeScriptsTest {
             userId = 0,
             expectedRequestId = "request-cancel-0001",
             replacementMarker = "cancel-request-cancel-0001-123-456",
+            ownerUid = "10123",
         )
 
         assertNotNull(script)
@@ -268,6 +271,36 @@ class RootFailSafeScriptsTest {
         assertTrue(script.contains("expired-*-\"\$EXPECTED_REQUEST\""))
         assertTrue(script.contains("cancel-\"\$EXPECTED_REQUEST\"-*"))
         assertTrue(script.contains("trap cleanup_revoke EXIT"))
+    }
+
+    @Test
+    fun `lease cancellation proves workspace ownership under the same flock`() {
+        val script = RootFailSafeScripts.revokeLease(
+            controllerId = SettingsRepository.CONTROLLER_SENSOR_PRIVACY,
+            targetPackage = "android-global-microphone",
+            userId = 0,
+            expectedRequestId = "request-cancel-0001",
+            replacementMarker = "cancel-request-cancel-0001-123-456",
+            ownerUid = "10123",
+        )!!
+
+        val ownerTest =
+            "test \"\$(cat /data/adb/micbridge/owner-uid 2>/dev/null)\" = '10123' || exit 78"
+        assertTrue(script.contains(ownerTest))
+
+        val lock = script.indexOf("flock -x 0")
+        val locked = script.indexOf("REVOKE_LOCKED=1", lock)
+        val owner = script.indexOf(ownerTest, locked)
+        val leaseRead = script.indexOf("CURRENT_REQUEST=\$(cat \"\$LEASE_FILE\")", owner)
+        val leaseFileTest = script.indexOf("if [ -f \"\$LEASE_FILE\" ]; then")
+        assertTrue(lock >= 0)
+        assertTrue(locked > lock)
+        assertTrue("owner check must run under the revoke flock", owner > locked)
+        assertTrue("owner check must precede the lease read", leaseRead > owner)
+        assertTrue("owner check must precede the lease read", leaseFileTest > owner)
+        // 78 is reserved for this check; the existing revoke exit codes must not move.
+        assertTrue(script.contains("exit 73"))
+        assertTrue(script.contains("exit 76"))
     }
 
     @Test
@@ -422,9 +455,13 @@ class RootFailSafeScriptsTest {
                 0,
                 "request-revoke-syntax",
                 "cancel-request-revoke-syntax-1-2",
+                "10123",
             )!!,
             watcher(SettingsRepository.CONTROLLER_APP_OPS),
             watcher(SettingsRepository.CONTROLLER_SENSOR_PRIVACY),
+            armWatcher(persistent = false),
+            armWatcher(persistent = true),
+            armWatcher(persistent = false, controllerId = SettingsRepository.CONTROLLER_APP_OPS),
         )
 
         scripts.forEach { script ->
@@ -491,6 +528,7 @@ class RootFailSafeScriptsTest {
                 0,
                 "request-framework-stdin",
                 "cancel-request-framework-stdin-1-2",
+                "10123",
             )!!,
         )
         val frameworkCommand = Regex(
@@ -503,6 +541,113 @@ class RootFailSafeScriptsTest {
             assertTrue(commandLines.isNotEmpty())
             commandLines.forEach { line -> assertTrue(line, line.contains("</dev/null")) }
         }
+    }
+
+    @Test
+    fun `arm handshake polls the watcher status at ten milliseconds for two seconds`() {
+        listOf(armWatcher(persistent = false), armWatcher(persistent = true)).forEach { script ->
+            assertTrue(script.contains("while [ \$i -lt 150 ]; do"))
+            val loop = script.indexOf("while [ \$i -lt 150 ]; do")
+            val pollSleep = script.indexOf("sleep 0.01", loop)
+            val loopEnd = script.indexOf("done", loop)
+            assertTrue(loop >= 0)
+            assertTrue("poll loop must sleep 0.01", pollSleep in (loop + 1) until loopEnd)
+            assertEquals(1, Regex("sleep 0\\.01").findAll(script).count())
+            // 150 polls x (10 ms + fork) keeps the arm budget at or below the previous ~2 s.
+            assertFalse(script.contains("while [ \$i -lt 40 ]"))
+        }
+    }
+
+    @Test
+    fun `persistent arm handshake only rechecks watcher liveness after armed`() {
+        val script = armWatcher(persistent = true)
+        val armed = script.indexOf("if [ \"\$STATUS\" = \"armed-request-12345678-\$WATCH_PID\" ]; then")
+        val branchEnd = script.indexOf("\n              fi", armed)
+        assertTrue(armed >= 0)
+        assertTrue(branchEnd > armed)
+        val branch = script.substring(armed, branchEnd)
+
+        assertEquals(
+            listOf(
+                "if [ \"\$STATUS\" = \"armed-request-12345678-\$WATCH_PID\" ]; then",
+                "kill -0 \"\$WATCH_PID\" 2>/dev/null",
+                "exit 0",
+            ),
+            branch.lines().map(String::trim).filter(String::isNotEmpty),
+        )
+        // No settle sleep and no post-armed /proc/uptime read: a persistent lease has no deadline.
+        assertFalse(script.contains("sleep 0.05"))
+        assertFalse(branch.contains("NOW_MS"))
+        assertFalse(branch.contains("/proc/uptime"))
+        assertFalse(script.contains("-ge '0'"))
+    }
+
+    @Test
+    fun `timed arm handshake still rechecks the open deadline after settling`() {
+        val script = armWatcher(persistent = false)
+        val armed = script.indexOf("if [ \"\$STATUS\" = \"armed-request-12345678-\$WATCH_PID\" ]; then")
+        val branchEnd = script.indexOf("\n              fi", armed)
+        assertTrue(armed >= 0)
+        assertTrue(branchEnd > armed)
+        val branch = script.substring(armed, branchEnd)
+
+        assertEquals(2, Regex("-ge '123446789'").findAll(branch).count())
+        assertEquals(1, Regex("sleep 0\\.05").findAll(script).count())
+        val firstDeadline = branch.indexOf("-ge '123446789'")
+        val settle = branch.indexOf("sleep 0.05", firstDeadline)
+        val secondDeadline = branch.indexOf("-ge '123446789'", settle)
+        val liveness = branch.indexOf("kill -0 \"\$WATCH_PID\" 2>/dev/null\n                exit 0")
+        assertTrue(settle > firstDeadline)
+        assertTrue(secondDeadline > settle)
+        assertTrue(liveness > secondDeadline)
+    }
+
+    @Test
+    fun `arm handshake publishes the active request last under the owner checked flock`() {
+        val script = armWatcher(persistent = true)
+
+        val lock = script.indexOf("flock -x 0")
+        val owner = script.indexOf(
+            "test \"\$(cat /data/adb/micbridge/owner-uid 2>/dev/null)\" = '10123'",
+            lock,
+        )
+        val watcherInstall = script.indexOf("mv -f \"\$WATCH_TMP\"", owner)
+        val spawn = script.indexOf("nohup sh '/data/adb/micbridge/watch-request-12345678.sh'", watcherInstall)
+        val pidRecord = script.indexOf("mv -f \"\$WATCH_PID_TMP\" \"\$WATCH_PID_FILE\"", spawn)
+        val meta = script.indexOf("mv -f \"\$META_TMP\" /data/adb/micbridge/lease-meta", pidRecord)
+        val lease = script.indexOf("mv -f \"\$LEASE_TMP\" /data/adb/micbridge/lease", meta)
+        val unlock = script.indexOf("flock -u 0\n            SETUP_LOCKED=0", lease)
+        assertTrue(lock >= 0)
+        assertTrue(owner > lock)
+        assertTrue(watcherInstall > owner)
+        assertTrue(spawn > watcherInstall)
+        assertTrue(pidRecord > spawn)
+        assertTrue(meta > pidRecord)
+        assertTrue(lease > meta)
+        assertTrue(unlock > lease)
+        assertTrue(script.contains("trap cleanup_setup EXIT"))
+        assertTrue(script.contains("trap 'exit 1' HUP INT TERM"))
+        assertTrue(script.contains("ARM_BY_MS=\$((SETUP_NOW_MS + 3000))"))
+    }
+
+    private fun armWatcher(
+        persistent: Boolean,
+        controllerId: String = SettingsRepository.CONTROLLER_SENSOR_PRIVACY,
+    ): String {
+        val script = RootFailSafeScripts.armWatcher(
+            controllerId = controllerId,
+            requestId = "request-12345678",
+            ownerUid = "10123",
+            appPid = "4321",
+            watcherPath = "/data/adb/micbridge/watch-request-12345678.sh",
+            watcherStatusPath = "/data/adb/micbridge/watch-request-12345678.status",
+            encodedWatcher = "IyEvc3lzdGVtL2Jpbi9zaAo=",
+            openValidUntilElapsedRealtimeMs = if (persistent) 0L else 123_446_789L,
+            hardDeadlineElapsedRealtimeMs = if (persistent) 0L else 123_456_789L,
+            persistent = persistent,
+        )
+        assertNotNull(script)
+        return script!!
     }
 
     private fun watcher(controllerId: String): String {

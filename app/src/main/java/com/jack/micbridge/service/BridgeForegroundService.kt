@@ -1975,25 +1975,39 @@ class BridgeForegroundService : Service() {
         )
     }
 
-    private fun notification(snapshot: BridgeSnapshot): Notification {
-        val contentIntent = PendingIntent.getActivity(
+    // These three PendingIntents never vary between snapshots, but every notification() call
+    // used to rebuild them over Binder. Building them once keeps each snapshot update cheap;
+    // the request codes, intents and flags are unchanged, so the resulting PendingIntents are
+    // identical to the ones the previous code produced.
+    private val notificationContentIntent: PendingIntent by lazy {
+        PendingIntent.getActivity(
             this,
             0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val blockIntent = PendingIntent.getService(
+    }
+    private val notificationBlockIntent: PendingIntent by lazy {
+        PendingIntent.getService(
             this,
             1,
             Intent(this, BridgeForegroundService::class.java).setAction(ACTION_BLOCK),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val stopIntent = PendingIntent.getService(
+    }
+    private val notificationStopIntent: PendingIntent by lazy {
+        PendingIntent.getService(
             this,
             2,
             Intent(this, BridgeForegroundService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+    }
+
+    private fun notification(snapshot: BridgeSnapshot): Notification {
+        val contentIntent = notificationContentIntent
+        val blockIntent = notificationBlockIntent
+        val stopIntent = notificationStopIntent
         val title = when {
             snapshot.transitioning -> "MicBridge：状态切换中"
             snapshot.lastError != null && snapshot.controlReadback &&
