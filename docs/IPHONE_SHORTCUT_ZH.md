@@ -48,6 +48,10 @@ http://192.168.43.1:8787/v1/mic/toggle
 
 iPhone 和 Android 必须位于同一受监控的私有局域网。Android API 31–35 只支持两台设备连接同一个可信 Wi‑Fi；该版本范围不支持 Android 自建热点。API 36+ 可以优先让 Android 开热点、iPhone 加入，但只有 MicBridge 成功注册 `TetheringManager` 监控并在 UI 显示热点监听地址时才可配置。访客网络、客户端隔离和部分厂商热点会阻止设备互访。
 
+> 预制文件：`tools/shortcuts/MicBridgeWorker.shortcut` 已按本节结构生成，可直接导入后只改令牌和地址。
+> 该文件**未签名且未经真机导入验证**，令牌为占位符；限制、导入方式与逐动作核对清单见
+> [tools/shortcuts/README_ZH.md](../tools/shortcuts/README_ZH.md)。若导入失败或动作异常，按本节手工搭建。
+
 ## 3. 创建主快捷指令 `MicBridgeWorker`
 
 英文短名称是为了让后面的 URL 回调无需处理中文转义；可以换名，但 URL 中的名字必须完全一致。
