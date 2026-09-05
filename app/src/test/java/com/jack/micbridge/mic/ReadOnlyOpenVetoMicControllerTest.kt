@@ -163,6 +163,106 @@ class ReadOnlyOpenVetoMicControllerTest {
         assertEquals(0, vetoReads)
     }
 
+    @Test
+    fun `veto read on a non-foreground target executes no root command`() = runTest {
+        val shell = CountingRootShell(shellSuccess("RECORD_AUDIO: allow"))
+        val veto = AppOpsReadOnlyOpenVeto(shell, { TARGET_PACKAGE }, { false })
+
+        assertEquals(MicAccessState.UNKNOWN, veto.readState(target))
+        assertEquals(0, shell.executions)
+        assertTrue(shell.commands.isEmpty())
+    }
+
+    @Test
+    fun `veto read on a negative user id executes no root command`() = runTest {
+        val shell = CountingRootShell(shellSuccess("RECORD_AUDIO: allow"))
+        val veto = AppOpsReadOnlyOpenVeto(shell, { TARGET_PACKAGE }, { true })
+
+        assertEquals(
+            MicAccessState.UNKNOWN,
+            veto.readState(target.copy(userId = -1)),
+        )
+        assertEquals(0, shell.executions)
+    }
+
+    @Test
+    fun `foreground veto read drops the am user probe from the root command`() = runTest {
+        val shell = CountingRootShell(shellSuccess("RECORD_AUDIO: allow"))
+        val checkedUserIds = mutableListOf<Int>()
+        val veto = AppOpsReadOnlyOpenVeto(shell, { TARGET_PACKAGE }) { userId ->
+            checkedUserIds += userId
+            true
+        }
+
+        assertEquals(MicAccessState.OPEN, veto.readState(target))
+        assertEquals(listOf(0), checkedUserIds)
+        assertEquals(1, shell.executions)
+        val command = shell.commands.single()
+        assertFalse(command.contains("am get-current-user"))
+        assertFalse(command.contains("CURRENT_USER"))
+        assertEquals(
+            "exec cmd appops get --user 0 '$TARGET_PACKAGE' RECORD_AUDIO",
+            command,
+        )
+    }
+
+    @Test
+    fun `foreground veto read still maps AppOps output to veto state`() = runTest {
+        val explicit = AppOpsReadOnlyOpenVeto(
+            CountingRootShell(shellSuccess("Uid mode: RECORD_AUDIO: ignore")),
+            { TARGET_PACKAGE },
+            { true },
+        )
+        assertEquals(MicAccessState.BLOCKED, explicit.readState(target))
+
+        val conditional = AppOpsReadOnlyOpenVeto(
+            CountingRootShell(shellSuccess("RECORD_AUDIO: foreground; time=+1m")),
+            { TARGET_PACKAGE },
+            { true },
+        )
+        assertEquals(MicAccessState.OPEN, conditional.readState(target))
+
+        val unparseable = AppOpsReadOnlyOpenVeto(
+            CountingRootShell(shellSuccess("RECORD_AUDIO: ask")),
+            { TARGET_PACKAGE },
+            { true },
+        )
+        assertEquals(MicAccessState.UNKNOWN, unparseable.readState(target))
+    }
+
+    @Test
+    fun `failed root read cannot be treated as a non-veto`() = runTest {
+        val shell = CountingRootShell(
+            ShellResult(1, "", "denied", timedOut = false, durationMs = 1),
+        )
+        val veto = AppOpsReadOnlyOpenVeto(shell, { TARGET_PACKAGE }, { true })
+
+        assertEquals(MicAccessState.UNKNOWN, veto.readState(target))
+        assertEquals(1, shell.executions)
+    }
+
+    @Test
+    fun `invalid target package is refused before any root command`() = runTest {
+        val shell = CountingRootShell(shellSuccess("RECORD_AUDIO: allow"))
+        val veto = AppOpsReadOnlyOpenVeto(shell, { "not a package" }, { true })
+
+        assertEquals(MicAccessState.UNKNOWN, veto.readState(target))
+        assertEquals(0, shell.executions)
+    }
+
+    private fun shellSuccess(stdout: String) =
+        ShellResult(0, stdout, "", timedOut = false, durationMs = 1)
+
+    private class CountingRootShell(private val response: ShellResult) : RootShell() {
+        val commands = mutableListOf<String>()
+        val executions: Int get() = commands.size
+
+        override suspend fun execute(command: String, timeoutMs: Long): ShellResult {
+            commands += command
+            return response
+        }
+    }
+
     private fun wrapped(
         primary: MicController,
         state: suspend (SafetyTarget) -> MicAccessState,
@@ -206,5 +306,9 @@ class ReadOnlyOpenVetoMicControllerTest {
             controlReadback = requested == state,
             durationMs = 1L,
         )
+    }
+
+    private companion object {
+        const val TARGET_PACKAGE = "com.openai.chatgpt"
     }
 }

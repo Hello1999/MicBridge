@@ -38,7 +38,11 @@ object ControllerFactory {
         return ReadOnlyOpenVetoMicController(
             primary = selected,
             vetoName = "ChatGPT AppOps",
-            veto = AppOpsReadOnlyOpenVeto(rootShell, settings),
+            veto = AppOpsReadOnlyOpenVeto(
+                rootShell,
+                settings,
+                AppOpsReadOnlyOpenVeto.inProcessForegroundUserCheck(context),
+            ),
         )
     }
 }

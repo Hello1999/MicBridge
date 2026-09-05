@@ -7,6 +7,10 @@ package com.jack.micbridge.mic
  * watcher to finish a BLOCK and then have an already-authorized Root shell perform a late OPEN:
  * either OPEN owns the lock first (the watcher blocks immediately after it), or the watcher owns
  * it first and the marker/deadline check rejects OPEN after the lock becomes available.
+ *
+ * Every check here runs while the microphone toggle is already waiting, so the script reads its
+ * evidence with [RootShellIdioms] shell builtins instead of `cat`/`awk` children. The checks,
+ * their order and their exit codes are unchanged; only the number of forks is.
  */
 internal object RootOpenAuthorizationGuard {
     private const val ROOT_DIR = "/data/adb/micbridge"
@@ -21,6 +25,7 @@ internal object RootOpenAuthorizationGuard {
             authorization.persistent || authorization.validUntilElapsedRealtimeMs > 0L,
         )
         return """
+            set -f
             OPEN_REQUEST_ID=${RootShell.quote(requestId)}
             OPEN_VALID_UNTIL_MS=${RootShell.quote(authorization.validUntilElapsedRealtimeMs.toString())}
             OPEN_PERSISTENT=${if (authorization.persistent) "1" else "0"}
@@ -48,7 +53,7 @@ internal object RootOpenAuthorizationGuard {
               sleep 0.025
             done
             [ "${'$'}OPEN_LOCKED" = 1 ] || exit 72
-            CURRENT_REQUEST=${'$'}(cat $LEASE_FILE 2>/dev/null)
+            ${RootShellIdioms.readSingleLineFile("CURRENT_REQUEST", LEASE_FILE)}
             [ "${'$'}CURRENT_REQUEST" = "${'$'}OPEN_REQUEST_ID" ] || exit 73
             META_REQUEST= META_BLOCK_AT= META_DEADLINE= META_APP_PID= META_APP_START= META_GENERATION= META_ARM_BY= META_EXTRA=
             IFS='|' read -r META_REQUEST META_BLOCK_AT META_DEADLINE META_APP_PID META_APP_START META_GENERATION META_ARM_BY META_EXTRA < $LEASE_META_FILE || exit 73
@@ -68,32 +73,32 @@ internal object RootOpenAuthorizationGuard {
             if [ "${'$'}OPEN_PERSISTENT" != 1 ]; then
               [ "${'$'}META_BLOCK_AT" -lt "${'$'}META_DEADLINE" ] || exit 73
             fi
-            [ "${'$'}(cat $GENERATION_FILE 2>/dev/null)" = "${'$'}META_GENERATION" ] || exit 73
-            APP_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}META_APP_PID/stat" 2>/dev/null)
-            APP_STATE=${'$'}{APP_PROC%%\|*}
-            APP_START=${'$'}{APP_PROC#*\|}
+            ${RootShellIdioms.readSingleLineFile("OPEN_GENERATION", GENERATION_FILE)}
+            [ "${'$'}OPEN_GENERATION" = "${'$'}META_GENERATION" ] || exit 73
+            ${RootShellIdioms.procStatStateAndStart("APP_STATE", "APP_START", "/proc/\$META_APP_PID/stat")}
             kill -0 "${'$'}META_APP_PID" 2>/dev/null || exit 73
             [ "${'$'}APP_START" = "${'$'}META_APP_START" ] || exit 73
             case "${'$'}APP_STATE" in R|S) ;; *) exit 73;; esac
             WATCH_SCRIPT=$ROOT_DIR/watch-${'$'}OPEN_REQUEST_ID.sh
-            WATCH_PID=${'$'}(cat $ROOT_DIR/watch-${'$'}OPEN_REQUEST_ID.pid 2>/dev/null)
+            ${RootShellIdioms.readSingleLineFile("WATCH_PID", "$ROOT_DIR/watch-\$OPEN_REQUEST_ID.pid")}
             case "${'$'}WATCH_PID" in ''|*[!0-9]*) exit 73;; esac
             kill -0 "${'$'}WATCH_PID" 2>/dev/null || exit 73
-            WATCH_STATE=${'$'}(awk '{print ${'$'}3}' "/proc/${'$'}WATCH_PID/stat" 2>/dev/null)
+            ${RootShellIdioms.procStatState("WATCH_STATE", "/proc/\$WATCH_PID/stat")}
             case "${'$'}WATCH_STATE" in R|S) ;; *) exit 73;; esac
             tr '\000' ' ' < "/proc/${'$'}WATCH_PID/cmdline" 2>/dev/null | grep -Fq "${'$'}WATCH_SCRIPT" || exit 73
-            [ "${'$'}(cat $ROOT_DIR/watch-${'$'}OPEN_REQUEST_ID.status 2>/dev/null)" = "armed-${'$'}OPEN_REQUEST_ID-${'$'}WATCH_PID" ] || exit 73
-            BOOT_RECORD=${'$'}(cat $ROOT_DIR/boot-${'$'}META_GENERATION.pid 2>/dev/null)
+            ${RootShellIdioms.readSingleLineFile("WATCH_STATUS", "$ROOT_DIR/watch-\$OPEN_REQUEST_ID.status")}
+            [ "${'$'}WATCH_STATUS" = "armed-${'$'}OPEN_REQUEST_ID-${'$'}WATCH_PID" ] || exit 73
+            ${RootShellIdioms.readSingleLineFile("BOOT_RECORD", "$ROOT_DIR/boot-\$META_GENERATION.pid")}
             BOOT_PID=${'$'}{BOOT_RECORD%%\|*}
             BOOT_START=${'$'}{BOOT_RECORD#*\|}
             case "${'$'}BOOT_PID" in ''|*[!0-9]*) exit 73;; esac
             case "${'$'}BOOT_START" in ''|*[!0-9]*) exit 73;; esac
             kill -0 "${'$'}BOOT_PID" 2>/dev/null || exit 73
-            BOOT_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}BOOT_PID/stat" 2>/dev/null)
-            case "${'$'}{BOOT_PROC%%\|*}" in R|S) ;; *) exit 73;; esac
-            [ "${'$'}{BOOT_PROC#*\|}" = "${'$'}BOOT_START" ] || exit 73
+            ${RootShellIdioms.procStatStateAndStart("BOOT_PROC_STATE", "BOOT_PROC_START", "/proc/\$BOOT_PID/stat")}
+            case "${'$'}BOOT_PROC_STATE" in R|S) ;; *) exit 73;; esac
+            [ "${'$'}BOOT_PROC_START" = "${'$'}BOOT_START" ] || exit 73
             tr '\000' ' ' < "/proc/${'$'}BOOT_PID/cmdline" 2>/dev/null | grep -Fq "$ROOT_DIR/boot-${'$'}META_GENERATION.sh" || exit 73
-            OPEN_NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
+            ${RootShellIdioms.uptimeMillis("OPEN_NOW_MS")}
             case "${'$'}OPEN_NOW_MS" in ''|*[!0-9]*) exit 74;; esac
             if [ "${'$'}OPEN_PERSISTENT" != 1 ]; then
               [ "${'$'}OPEN_NOW_MS" -lt "${'$'}OPEN_VALID_UNTIL_MS" ] || exit 75

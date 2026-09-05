@@ -489,7 +489,13 @@ class BridgeForegroundService : Service() {
                                 val isolated = coordinator.calibrationIsolateRootFailsafe(
                                     rootGate = calibrationRootGate,
                                     audioGate = AudioManagerMicController(audioManager),
-                                    appOpsVeto = AppOpsReadOnlyOpenVeto(rootShell, settings),
+                                    appOpsVeto = AppOpsReadOnlyOpenVeto(
+                                        rootShell,
+                                        settings,
+                                        AppOpsReadOnlyOpenVeto.inProcessForegroundUserCheck(
+                                            this@BridgeForegroundService,
+                                        ),
+                                    ),
                                     // Keep the fast audible cut inside the coordinator mutex so
                                     // the 250 ms drift monitor cannot mistake this intentional
                                     // split state for an external mutation and revoke the round.
@@ -531,7 +537,13 @@ class BridgeForegroundService : Service() {
                                 val confirmed = coordinator.confirmRootIsolationAndBlock(
                                     rootGate = SensorPrivacyRootController(rootShell),
                                     audioGate = AudioManagerMicController(audioManager),
-                                    appOpsVeto = AppOpsReadOnlyOpenVeto(rootShell, settings),
+                                    appOpsVeto = AppOpsReadOnlyOpenVeto(
+                                        rootShell,
+                                        settings,
+                                        AppOpsReadOnlyOpenVeto.inProcessForegroundUserCheck(
+                                            this@BridgeForegroundService,
+                                        ),
+                                    ),
                                 )
                                 val after = settings.currentAcousticCalibrationIdentity()
                                 val identityStable = calibrationSession.matchesCurrentIdentity(after)
@@ -926,8 +938,11 @@ class BridgeForegroundService : Service() {
 
     /**
      * Keeps a known transition-time microphone broadcast inside the HTTP mutation's commit
-     * boundary. A success response is not released until a fresh composite read agrees with
-     * the operation result. Throwing here is intentional: ApiRouter emits a parseable
+     * boundary. The pending event is always ACTION_MICROPHONE_MUTE_CHANGED, which describes
+     * exactly one gate, so the commit boundary re-verifies that gate: the AudioManager mute
+     * flag the transition-time broadcast describes. The other gates keep their in-mutation
+     * fresh readbacks, and any later external change is handled by the periodic monitors and
+     * the next fresh read. Throwing here is intentional: ApiRouter emits a parseable
      * ok=false envelope and LocalHttpServer closes/rebuilds the listener after writing it.
      */
     private suspend fun executeRemoteMutation(
@@ -943,11 +958,14 @@ class BridgeForegroundService : Service() {
             var checks = 0
             while (micTransitionEventCounter.get() > micRemoteVerifiedEvent.get()) {
                 val event = micTransitionEventCounter.get()
-                val checked = coordinator.readSnapshot(true, boundAddresses)
+                val actualBlocked = runCatching { audioManager.isMicrophoneMute }.getOrNull()
                 micRemoteVerifiedEvent.updateAndGet { prior -> maxOf(prior, event) }
                 micAsyncClaimedEvent.updateAndGet { prior -> maxOf(prior, event) }
-                val agrees = checked.controlReadback && checked.lastError == null &&
-                    checked.micAccess == result.micAccess
+                val agrees = when (result.micAccess) {
+                    MicAccessState.BLOCKED -> actualBlocked == true
+                    MicAccessState.OPEN -> actualBlocked == false
+                    MicAccessState.UNKNOWN -> false
+                }
                 if (!agrees) {
                     remoteMutationFenceActive = true
                     try {

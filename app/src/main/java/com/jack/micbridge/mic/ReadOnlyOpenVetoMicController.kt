@@ -1,5 +1,7 @@
 package com.jack.micbridge.mic
 
+import android.content.Context
+import android.os.UserManager
 import com.jack.micbridge.data.ControlResult
 import com.jack.micbridge.data.MicAccessState
 import com.jack.micbridge.data.ProbeResult
@@ -136,21 +138,31 @@ class ReadOnlyOpenVetoMicController(
 }
 
 /** Strict read-only AppOps veto for the package selected in settings. */
-class AppOpsReadOnlyOpenVeto(
+class AppOpsReadOnlyOpenVeto internal constructor(
     private val shell: RootShell,
-    private val settings: SettingsRepository,
+    private val targetPackageProvider: () -> String,
+    private val targetUserIsForeground: (Int) -> Boolean,
 ) : ReadOnlyOpenVeto {
+    constructor(
+        shell: RootShell,
+        settings: SettingsRepository,
+        targetUserIsForeground: (Int) -> Boolean,
+    ) : this(shell, { settings.targetPackage }, targetUserIsForeground)
+
     override suspend fun readState(target: SafetyTarget): MicAccessState {
         if (target.userId < 0) return MicAccessState.UNKNOWN
+        // The frozen target user must still be the foreground user. This app can only build
+        // targets for its own Android user, so "our user is foreground and equals the target
+        // user" is the same decision the former `am get-current-user` probe made, without its
+        // ~40-60 ms shell round trip. A target belonging to any other user is not provable in
+        // process and therefore fails closed as UNKNOWN, which still vetoes OPEN.
+        if (!targetUserIsForeground(target.userId)) return MicAccessState.UNKNOWN
         val packageName = runCatching {
-            RootShell.requirePackageName(settings.targetPackage)
+            RootShell.requirePackageName(targetPackageProvider())
         }.getOrNull() ?: return MicAccessState.UNKNOWN
         val result = shell.execute(
-            """
-                CURRENT_USER=${'$'}(am get-current-user 2>/dev/null) || exit 76
-                [ "${'$'}CURRENT_USER" = ${RootShell.quote(target.userId.toString())} ] || exit 77
-                exec cmd appops get --user ${target.userId} ${RootShell.quote(packageName)} RECORD_AUDIO
-            """.trimIndent(),
+            "exec cmd appops get --user ${target.userId} " +
+                "${RootShell.quote(packageName)} RECORD_AUDIO",
             timeoutMs = VETO_READ_TIMEOUT_MS,
         )
         if (!result.succeeded) return MicAccessState.UNKNOWN
@@ -159,6 +171,7 @@ class AppOpsReadOnlyOpenVeto(
 
     companion object {
         private const val VETO_READ_TIMEOUT_MS = 1_000L
+        private const val PER_USER_RANGE = 100_000
         private val EXPLICIT_VETO_MODES = setOf(
             AppOpsModeReader.MODE_IGNORE,
             AppOpsModeReader.MODE_DENY,
@@ -169,6 +182,18 @@ class AppOpsReadOnlyOpenVeto(
             AppOpsModeReader.MODE_DEFAULT,
             AppOpsModeReader.MODE_FOREGROUND,
         )
+
+        /**
+         * In-process equivalent of the removed `am get-current-user` guard: the target user must
+         * be this app's own user, and this app's user must currently be the foreground user.
+         * Any read failure resolves to `false`, i.e. an UNKNOWN veto read.
+         */
+        fun inProcessForegroundUserCheck(context: Context): (Int) -> Boolean = { userId ->
+            userId == android.os.Process.myUid() / PER_USER_RANGE &&
+                runCatching {
+                    context.getSystemService(UserManager::class.java).isUserForeground
+                }.getOrDefault(false)
+        }
 
         fun modesToVetoState(
             modes: AppOpsModeReader.Companion.ParsedModes?,

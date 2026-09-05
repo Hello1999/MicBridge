@@ -108,6 +108,8 @@ PulseCount = 3
 
 HTTP 200 本身不是成功；必须继续检查 `ok`、`verified`、`mic_access` 与回显请求 ID。Android 对已经通过认证和协议校验并受理的失败（包括 `REQUEST_ID_CONFLICT`、控制/校准失败和内部异常）有意返回 HTTP 200 + `ok=false`，使默认流程能够主动调用 3 次“振动设备”。认证、请求 ID 格式、方法、路径或 HTTP 协议错误仍是 4xx。部分 iOS 版本会在 JSON 格式错误或 HTTP 4xx/5xx 时直接终止动作，而不是返回可供分支处理的字典。因此，上面的默认值只保护“工作流仍继续执行”的失败，不等同于捕获所有网络和解析异常。
 
+想少配几个动作，可改用 3.5 的 `haptic_pulses` 精简版；它得出的 1/2/3 与本节完全相同，且同样强制比较回显请求 ID。
+
 ### 3.4 只执行一个自定义触感分支
 
 添加“重复”动作，重复次数选择变量 `PulseCount`，在循环内只放一个“振动设备”动作。这样每次成功解析后恰好**主动调用**该动作 1、2 或 3 次，不会先调用一次再追加另一种状态。验收时查看快捷指令动作执行或屏幕录制，并把系统触感另记，不能仅凭身体感觉把两类触感相加。
@@ -129,6 +131,43 @@ Apple 没有公开承诺连续触感的最小可靠间隔，而且 Action Button
 ```
 
 成功的 1/2 次分支不得显示这条错误通知。通知可能按 iPhone 当前系统设置附带声音或系统触感；它不计入协议的三次“振动设备”，也不得作为默认配置或成功/失败判据。
+
+### 3.5 精简版：使用 `haptic_pulses`
+
+Android 在除 `/healthz` 外的每个 JSON 信封里都返回整数字段 `haptic_pulses`，它由服务端用 3.3 完全相同的 `ok`/`verified`/`mic_access` 规则算出：已验证 `open` 为 `1`，已验证 `blocked` 为 `2`，其余一切情况为 `3`。用它可以把 3.3–3.4 的四个“获取字典值”、多层嵌套“如果”和手工 `PulseCount` 赋值换成下面这一组动作，每次运行大约少六个动作：
+
+1. 从 `Response` 用“获取字典值”取 `request_id` → `ResponseRequestId`，取 `haptic_pulses` → `ServerPulses`。
+2. 添加“数字”动作，值设为 `3`，再“设定变量” `PulseCount`。它仍是保守默认值。
+3. 如果 `ResponseRequestId` 完全等于 `RequestId`：如果 `ServerPulses` 是数字且等于 `1` 或 `2`，则把 `PulseCount` 设为 `ServerPulses`；结束如果。
+4. 添加“重复”动作，重复次数选择 `PulseCount`，循环内只放一个“振动设备”。
+
+```text
+ResponseRequestId = 获取字典值 request_id（来自 Response）
+ServerPulses      = 获取字典值 haptic_pulses（来自 Response）
+
+PulseCount = 3
+
+如果 ResponseRequestId 完全等于 RequestId
+  如果 ServerPulses 是数字且等于 1 或 2
+    PulseCount = ServerPulses
+  结束如果
+结束如果
+
+重复 PulseCount 次
+  振动设备
+结束重复
+```
+
+必须理解的边界：
+
+- **回显请求 ID 的比较仍然强制在 iPhone 端完成。** `haptic_pulses` 不替代这一步，它只折叠 `ok`、`verified`、`mic_access` 三项判断。
+- **只有在 `ResponseRequestId` 与本次的 `RequestId` 完全相等时才可采用服务端给的数字。** ID 不匹配说明这不是本次请求的结果，此时必须保留 `PulseCount=3`。
+- **字段缺失、为空、不是数字或不等于 1/2 时保留 `PulseCount=3`。** 不要把 `3` 之外的任何未知值直接传给“重复”。
+- 三次仍然表示“失败或状态无法确认”，不表示“已经安全屏蔽”；网络层直接中止时依旧可能没有任何自定义触感，按第 4 节处理。
+- 这一版每次运行大约少六个动作，因而略微缩短解析到触感之间的时间；但它不改变任何判定标准，也不减少 HTTP 请求（仍然只有一次 `POST /v1/mic/toggle`）。
+- **3.3 的完整判断仍是本协议的参考行为。** 两种写法都可接受：3.3 完全在 iPhone 端复算，3.5 复用服务端预算结果；两者对同一响应必须给出相同的 1/2/3。验收测试（第 7 节）对两种写法要求完全一致的结果。
+
+如果 3.5 与 3.3 在真机上出现不同次数，以 3.3 的判断为准并按“状态未知”处理，同时记录响应原文用于排查。
 
 ## 4. 网络直接失败时的两种配置
 

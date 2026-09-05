@@ -10,6 +10,7 @@ import com.jack.micbridge.data.DirectBootSettings
 import com.jack.micbridge.data.SettingsRepository
 import com.jack.micbridge.data.SafetyTarget
 import com.jack.micbridge.mic.RootShell
+import com.jack.micbridge.mic.RootShellIdioms
 import com.jack.micbridge.mic.SensorPrivacyRootProtocol
 import com.jack.micbridge.receiver.EmergencyBlockReceiver
 import kotlinx.coroutines.Dispatchers
@@ -190,17 +191,40 @@ class AutoBlockSafety(
         )
     }
 
-    override suspend fun cancel() = mutationGate.withLock {
+    /**
+     * The locked half of [cancel], usable on its own so a BLOCK toggle can run it before the
+     * controller stack instead of after. It blocks and verifies the effective gate and replaces
+     * the lease marker under the root flock; it never touches the durable lease store or the
+     * alarms, so failing or stopping here leaves every fail-safe exactly as it was.
+     */
+    override suspend fun revokeRootLeaseAfterVerifiedBlock(): Boolean = mutationGate.withLock {
+        val active = leaseStore.load() ?: return@withLock false
+        if (active.target.controllerId !in ROOT_WATCHDOG_CONTROLLERS) return@withLock false
+        val marker =
+            "cancel-${active.requestId}-${System.currentTimeMillis()}-${SecureRandom().nextInt().toUInt()}"
+        revokeRootLeaseAfterVerifiedBlock(active, marker)
+    }
+
+    override suspend fun cancel() = cancel(rootLeaseAlreadyRevoked = false)
+
+    override suspend fun cancel(rootLeaseAlreadyRevoked: Boolean) = mutationGate.withLock {
         val active = leaseStore.load()
         if (active != null && active.target.controllerId in ROOT_WATCHDOG_CONTROLLERS) {
-            val marker =
-                "cancel-${active.requestId}-${System.currentTimeMillis()}-${SecureRandom().nextInt().toUInt()}"
-            // The revoke script proves workspace ownership under the same flock it uses to block
-            // and replace the marker, so a separate ownership round trip would only add latency
-            // before an OPEN can be closed. A foreign owner fails this check inside the script
-            // and therefore still surfaces through the same fail-closed `check` below.
-            check(revokeRootLeaseAfterVerifiedBlock(active, marker)) {
-                "Root lease could not be atomically blocked and revoked"
+            // The caller already ran this exact script for this lease and it succeeded, which
+            // means the gate was blocked and freshly read back and the marker replaced, all
+            // under the flock, and workspace ownership was proven inside it. Running it a
+            // second time would re-block an already-BLOCKED gate at full Root cost.
+            if (!rootLeaseAlreadyRevoked) {
+                val marker =
+                    "cancel-${active.requestId}-${System.currentTimeMillis()}-${SecureRandom().nextInt().toUInt()}"
+                // The revoke script proves workspace ownership under the same flock it uses to
+                // block and replace the marker, so a separate ownership round trip would only
+                // add latency before an OPEN can be closed. A foreign owner fails this check
+                // inside the script and therefore still surfaces through the same fail-closed
+                // `check` below.
+                check(revokeRootLeaseAfterVerifiedBlock(active, marker)) {
+                    "Root lease could not be atomically blocked and revoked"
+                }
             }
         } else {
             check(ownsRootWorkspace()) {
@@ -227,63 +251,11 @@ class AutoBlockSafety(
         val safeId = runCatching { RootShell.requireOpaqueId(requestId) }.getOrNull() ?: return false
         val appPid = android.os.Process.myPid().toString()
         val result = rootShell.execute(
-            """
-                set -e
-                command -v flock >/dev/null 2>&1
-                command -v awk >/dev/null 2>&1
-                command -v grep >/dev/null 2>&1
-                command -v tr >/dev/null 2>&1
-                exec 0>>$ROOT_LEASE_LOCK_FILE
-                flock -x 0
-                test "${'$'}(cat $ROOT_OWNER_FILE 2>/dev/null)" = ${RootShell.quote(android.os.Process.myUid().toString())}
-                CURRENT_REQUEST=${'$'}(cat $LEASE_FILE 2>/dev/null)
-                test "${'$'}CURRENT_REQUEST" = ${RootShell.quote(safeId)}
-                META_REQUEST= META_BLOCK_AT= META_DEADLINE= META_APP_PID= META_APP_START= META_GENERATION= META_ARM_BY= META_EXTRA=
-                IFS='|' read -r META_REQUEST META_BLOCK_AT META_DEADLINE META_APP_PID META_APP_START META_GENERATION META_ARM_BY META_EXTRA < $LEASE_META_FILE
-                test "${'$'}META_REQUEST" = "${'$'}CURRENT_REQUEST"
-                test -z "${'$'}META_EXTRA"
-                test "${'$'}META_APP_PID" = ${RootShell.quote(appPid)}
-                case "${'$'}META_BLOCK_AT" in ''|*[!0-9]*) exit 1;; esac
-                case "${'$'}META_DEADLINE" in ''|*[!0-9]*) exit 1;; esac
-                case "${'$'}META_APP_START" in ''|*[!0-9]*) exit 1;; esac
-                case "${'$'}META_ARM_BY" in ''|*[!0-9]*) exit 1;; esac
-                case "${'$'}META_GENERATION" in ''|*[!A-Za-z0-9._-]*) exit 1;; esac
-                if [ "${'$'}META_BLOCK_AT" = 0 ]; then
-                  test "${'$'}META_DEADLINE" = 0
-                else
-                  test "${'$'}META_BLOCK_AT" -lt "${'$'}META_DEADLINE"
-                fi
-                test "${'$'}(cat $ROOT_BOOT_GENERATION_FILE 2>/dev/null)" = "${'$'}META_GENERATION"
-                NOW_MS=${'$'}(awk '{printf "%.0f\n", ${'$'}1 * 1000}' /proc/uptime 2>/dev/null)
-                case "${'$'}NOW_MS" in ''|*[!0-9]*) exit 1;; esac
-                if [ "${'$'}META_BLOCK_AT" != 0 ]; then
-                  test "${'$'}NOW_MS" -lt "${'$'}META_BLOCK_AT"
-                fi
-                APP_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}META_APP_PID/stat" 2>/dev/null)
-                APP_STATE=${'$'}{APP_PROC%%\|*}
-                APP_START=${'$'}{APP_PROC#*\|}
-                test "${'$'}APP_START" = "${'$'}META_APP_START"
-                case "${'$'}APP_STATE" in R|S) ;; *) exit 1;; esac
-                WATCH_SCRIPT=$ROOT_DIR/watch-${'$'}CURRENT_REQUEST.sh
-                WATCH_PID=${'$'}(cat $ROOT_DIR/watch-${'$'}CURRENT_REQUEST.pid 2>/dev/null)
-                case "${'$'}WATCH_PID" in ''|*[!0-9]*) exit 1;; esac
-                kill -0 "${'$'}WATCH_PID" 2>/dev/null
-                WATCH_STATE=${'$'}(awk '{print ${'$'}3}' "/proc/${'$'}WATCH_PID/stat" 2>/dev/null)
-                case "${'$'}WATCH_STATE" in R|S) ;; *) exit 1;; esac
-                tr '\000' ' ' < "/proc/${'$'}WATCH_PID/cmdline" | grep -Fq "${'$'}WATCH_SCRIPT"
-                test "${'$'}(cat $ROOT_DIR/watch-${'$'}CURRENT_REQUEST.status 2>/dev/null)" = "armed-${'$'}CURRENT_REQUEST-${'$'}WATCH_PID"
-                BOOT_RECORD=${'$'}(cat $ROOT_DIR/boot-${'$'}META_GENERATION.pid 2>/dev/null)
-                BOOT_PID=${'$'}{BOOT_RECORD%%\|*}
-                BOOT_START=${'$'}{BOOT_RECORD#*\|}
-                case "${'$'}BOOT_PID" in ''|*[!0-9]*) exit 1;; esac
-                case "${'$'}BOOT_START" in ''|*[!0-9]*) exit 1;; esac
-                kill -0 "${'$'}BOOT_PID" 2>/dev/null
-                BOOT_PROC=${'$'}(awk '{print ${'$'}3 "|" ${'$'}22}' "/proc/${'$'}BOOT_PID/stat" 2>/dev/null)
-                case "${'$'}{BOOT_PROC%%\|*}" in R|S) ;; *) exit 1;; esac
-                test "${'$'}{BOOT_PROC#*\|}" = "${'$'}BOOT_START"
-                tr '\000' ' ' < "/proc/${'$'}BOOT_PID/cmdline" | grep -Fq "$ROOT_DIR/boot-${'$'}META_GENERATION.sh"
-                flock -u 0
-            """.trimIndent(),
+            verifyActiveGuardScript(
+                safeId = safeId,
+                appPid = appPid,
+                ownerUid = android.os.Process.myUid().toString(),
+            ),
             timeoutMs = ROOT_ARM_TIMEOUT_MS,
         )
         return result.succeeded
@@ -785,6 +757,80 @@ class AutoBlockSafety(
             SettingsRepository.CONTROLLER_APP_OPS,
             SettingsRepository.CONTROLLER_SENSOR_PRIVACY,
         )
+
+        /**
+         * Pure text of the read-only active-guard proof, extracted so the shell contract can be
+         * syntax- and order-checked on the host JVM. The caller has already validated [safeId]
+         * with [RootShell.requireOpaqueId]; [appPid] and [ownerUid] are numeric.
+         *
+         * This proof runs once per OPEN and then every 250 ms while the microphone is OPEN, so
+         * every read that a shell builtin can perform goes through [RootShellIdioms] instead of a
+         * `cat`/`awk` child. Only `flock` and the two `tr | grep` NUL scans still fork; the
+         * checks, their order and their exit codes are identical to the forking version.
+         */
+        internal fun verifyActiveGuardScript(
+            safeId: String,
+            appPid: String,
+            ownerUid: String,
+        ): String = """
+            set -e
+            set -f
+            command -v flock >/dev/null 2>&1
+            command -v awk >/dev/null 2>&1
+            command -v grep >/dev/null 2>&1
+            command -v tr >/dev/null 2>&1
+            exec 0>>$ROOT_LEASE_LOCK_FILE
+            flock -x 0
+            ${RootShellIdioms.readSingleLineFile("OWNER_UID", ROOT_OWNER_FILE)}
+            test "${'$'}OWNER_UID" = ${RootShell.quote(ownerUid)}
+            ${RootShellIdioms.readSingleLineFile("CURRENT_REQUEST", LEASE_FILE)}
+            test "${'$'}CURRENT_REQUEST" = ${RootShell.quote(safeId)}
+            META_REQUEST= META_BLOCK_AT= META_DEADLINE= META_APP_PID= META_APP_START= META_GENERATION= META_ARM_BY= META_EXTRA=
+            IFS='|' read -r META_REQUEST META_BLOCK_AT META_DEADLINE META_APP_PID META_APP_START META_GENERATION META_ARM_BY META_EXTRA < $LEASE_META_FILE
+            test "${'$'}META_REQUEST" = "${'$'}CURRENT_REQUEST"
+            test -z "${'$'}META_EXTRA"
+            test "${'$'}META_APP_PID" = ${RootShell.quote(appPid)}
+            case "${'$'}META_BLOCK_AT" in ''|*[!0-9]*) exit 1;; esac
+            case "${'$'}META_DEADLINE" in ''|*[!0-9]*) exit 1;; esac
+            case "${'$'}META_APP_START" in ''|*[!0-9]*) exit 1;; esac
+            case "${'$'}META_ARM_BY" in ''|*[!0-9]*) exit 1;; esac
+            case "${'$'}META_GENERATION" in ''|*[!A-Za-z0-9._-]*) exit 1;; esac
+            if [ "${'$'}META_BLOCK_AT" = 0 ]; then
+              test "${'$'}META_DEADLINE" = 0
+            else
+              test "${'$'}META_BLOCK_AT" -lt "${'$'}META_DEADLINE"
+            fi
+            ${RootShellIdioms.readSingleLineFile("BOOT_GENERATION", ROOT_BOOT_GENERATION_FILE)}
+            test "${'$'}BOOT_GENERATION" = "${'$'}META_GENERATION"
+            ${RootShellIdioms.uptimeMillis("NOW_MS")}
+            case "${'$'}NOW_MS" in ''|*[!0-9]*) exit 1;; esac
+            if [ "${'$'}META_BLOCK_AT" != 0 ]; then
+              test "${'$'}NOW_MS" -lt "${'$'}META_BLOCK_AT"
+            fi
+            ${RootShellIdioms.procStatStateAndStart("APP_STATE", "APP_START", "/proc/\$META_APP_PID/stat")}
+            test "${'$'}APP_START" = "${'$'}META_APP_START"
+            case "${'$'}APP_STATE" in R|S) ;; *) exit 1;; esac
+            WATCH_SCRIPT=$ROOT_DIR/watch-${'$'}CURRENT_REQUEST.sh
+            ${RootShellIdioms.readSingleLineFile("WATCH_PID", "$ROOT_DIR/watch-\$CURRENT_REQUEST.pid")}
+            case "${'$'}WATCH_PID" in ''|*[!0-9]*) exit 1;; esac
+            kill -0 "${'$'}WATCH_PID" 2>/dev/null
+            ${RootShellIdioms.procStatState("WATCH_STATE", "/proc/\$WATCH_PID/stat")}
+            case "${'$'}WATCH_STATE" in R|S) ;; *) exit 1;; esac
+            tr '\000' ' ' < "/proc/${'$'}WATCH_PID/cmdline" | grep -Fq "${'$'}WATCH_SCRIPT"
+            ${RootShellIdioms.readSingleLineFile("WATCH_STATUS", "$ROOT_DIR/watch-\$CURRENT_REQUEST.status")}
+            test "${'$'}WATCH_STATUS" = "armed-${'$'}CURRENT_REQUEST-${'$'}WATCH_PID"
+            ${RootShellIdioms.readSingleLineFile("BOOT_RECORD", "$ROOT_DIR/boot-\$META_GENERATION.pid")}
+            BOOT_PID=${'$'}{BOOT_RECORD%%\|*}
+            BOOT_START=${'$'}{BOOT_RECORD#*\|}
+            case "${'$'}BOOT_PID" in ''|*[!0-9]*) exit 1;; esac
+            case "${'$'}BOOT_START" in ''|*[!0-9]*) exit 1;; esac
+            kill -0 "${'$'}BOOT_PID" 2>/dev/null
+            ${RootShellIdioms.procStatStateAndStart("BOOT_PROC_STATE", "BOOT_PROC_START", "/proc/\$BOOT_PID/stat")}
+            case "${'$'}BOOT_PROC_STATE" in R|S) ;; *) exit 1;; esac
+            test "${'$'}BOOT_PROC_START" = "${'$'}BOOT_START"
+            tr '\000' ' ' < "/proc/${'$'}BOOT_PID/cmdline" | grep -Fq "$ROOT_DIR/boot-${'$'}META_GENERATION.sh"
+            flock -u 0
+        """.trimIndent()
     }
 
     private data class RootBootGuardTarget(

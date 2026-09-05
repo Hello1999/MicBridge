@@ -70,6 +70,7 @@ class ApiRouter(
                     "mic_access" to "unknown",
                     "verified" to false,
                     "request_id" to requestId,
+                    "haptic_pulses" to UNKNOWN_PULSES,
                     "error" to Json.error(
                         "INTERNAL_ERROR",
                         "修改请求发生内部错误；服务将安全屏蔽并重建监听",
@@ -88,11 +89,15 @@ class ApiRouter(
             snapshot.controlReadback &&
             snapshot.acousticCalibrationValid &&
             snapshot.lastError == null
+        val micAccess = snapshot.micAccess.wireValue
         return Json.objectOf(
         "ok" to verified,
-        "mic_access" to snapshot.micAccess.wireValue,
+        "mic_access" to micAccess,
         "transitioning" to snapshot.transitioning,
         "verified" to verified,
+        // The status envelope reports ok == verified, so both inputs of the shared rule are the
+        // same boolean here.
+        "haptic_pulses" to hapticPulses(ok = verified, verified = verified, micAccess = micAccess),
         "command_succeeded" to null,
         "control_readback" to snapshot.controlReadback,
         "acoustic_calibration_valid" to snapshot.acousticCalibrationValid,
@@ -125,9 +130,10 @@ class ApiRouter(
         val boundaryErrorMessage = result.errorMessage ?: if (!verified) {
             "当前控制状态或声学校准无法确认"
         } else null
+        val micAccess = result.micAccess.wireValue
         return Json.objectOf(
         "ok" to ok,
-        "mic_access" to result.micAccess.wireValue,
+        "mic_access" to micAccess,
         "previous" to result.previous.wireValue,
         "verified" to verified,
         "command_succeeded" to result.commandSucceeded,
@@ -135,6 +141,7 @@ class ApiRouter(
         "acoustic_calibration_valid" to result.acousticCalibrationValid,
         "controller" to result.controllerId,
         "request_id" to result.requestId,
+        "haptic_pulses" to hapticPulses(ok = ok, verified = verified, micAccess = micAccess),
         "auto_block_at" to Json.instant(result.autoBlockAtEpochMs),
         "lease_exact_alarm_armed" to result.leaseExactAlarmArmed,
         "lease_root_watchdog_armed" to result.leaseRootWatchdogArmed,
@@ -146,6 +153,16 @@ class ApiRouter(
     )
     }
 
+    // Server-side pre-computation of the pulse count the Apple Shortcut would otherwise derive
+    // from ok/verified/mic_access. It only folds those checks into one integer; the client still
+    // has to confirm the echoed request_id itself before it may trust this number.
+    private fun hapticPulses(ok: Boolean, verified: Boolean, micAccess: String): Int = when {
+        !ok || !verified -> UNKNOWN_PULSES
+        micAccess == OPEN_WIRE_VALUE -> OPEN_PULSES
+        micAccess == BLOCKED_WIRE_VALUE -> BLOCKED_PULSES
+        else -> UNKNOWN_PULSES
+    }
+
     private fun methodNotAllowed() = error(405, "METHOD_NOT_ALLOWED", "方法不支持")
 
     private fun error(status: Int, code: String, message: String) = HttpResponse(
@@ -154,6 +171,7 @@ class ApiRouter(
             "ok" to false,
             "mic_access" to "unknown",
             "verified" to false,
+            "haptic_pulses" to UNKNOWN_PULSES,
             "error" to Json.error(code, message),
             "server_time" to Instant.now().toString(),
         ),
@@ -171,5 +189,10 @@ class ApiRouter(
         )
         val REQUEST_ID_PATTERN = Regex("[A-Za-z0-9._-]{16,128}")
         val RESERVED_REQUEST_ID_PREFIXES = listOf("cancel-", "expired-", "removed-")
+        const val OPEN_PULSES = 1
+        const val BLOCKED_PULSES = 2
+        const val UNKNOWN_PULSES = 3
+        private val OPEN_WIRE_VALUE = com.jack.micbridge.data.MicAccessState.OPEN.wireValue
+        private val BLOCKED_WIRE_VALUE = com.jack.micbridge.data.MicAccessState.BLOCKED.wireValue
     }
 }

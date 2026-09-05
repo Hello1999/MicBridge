@@ -902,6 +902,130 @@ class MicCoordinatorTest {
         assertEquals(1, fixture.controller.blockCount)
     }
 
+    /**
+     * The locked revoke script already blocks the effective gate for every user and verifies the
+     * readback before it replaces the lease marker, so it is the block that the lease protocol
+     * depends on. Running it before `controller.block` keeps that ordering and lets the
+     * cross-gate controller observe an already-BLOCKED sensor gate, so one BLOCK toggle performs
+     * the expensive block-all-users round trip once rather than twice.
+     */
+    @Test
+    fun `root lease block toggle revokes under the flock before the controller block`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = true
+        assertTrue(
+            fixture.coordinator.execute(
+                MicCoordinator.ENDPOINT_TOGGLE,
+                "request-root-revoke-open-01",
+            ).ok,
+        )
+        fixture.time += 1_000L
+        fixture.events.clear()
+
+        val blocked = fixture.coordinator.execute(
+            MicCoordinator.ENDPOINT_TOGGLE,
+            "request-root-revoke-block-02",
+        )
+
+        assertEquals(listOf("revoke", "block", "cancel"), fixture.events)
+        assertEquals(1, fixture.lease.revokeCalls)
+        assertEquals(listOf(true), fixture.lease.cancelRootLeaseAlreadyRevoked)
+        assertTrue(blocked.ok)
+        assertEquals(MicAccessState.BLOCKED, blocked.micAccess)
+        assertEquals(MicAccessState.BLOCKED, fixture.controller.state)
+        assertNull(blocked.leaseRootWatchdogArmed)
+    }
+
+    /** A failed revoke only loses the optimisation: `cancel` still runs the script itself. */
+    @Test
+    fun `failed early revoke falls back to the unchanged cancel path`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = true
+        assertTrue(
+            fixture.coordinator.execute(
+                MicCoordinator.ENDPOINT_TOGGLE,
+                "request-root-revoke-fail-open-01",
+            ).ok,
+        )
+        fixture.time += 1_000L
+        fixture.events.clear()
+        fixture.lease.revokeSucceeds = false
+
+        val blocked = fixture.coordinator.execute(
+            MicCoordinator.ENDPOINT_TOGGLE,
+            "request-root-revoke-fail-block-02",
+        )
+
+        assertEquals(listOf("revoke", "block", "cancel"), fixture.events)
+        assertEquals(1, fixture.lease.revokeCalls)
+        assertEquals(listOf(false), fixture.lease.cancelRootLeaseAlreadyRevoked)
+        assertTrue(blocked.ok)
+        assertEquals(MicAccessState.BLOCKED, blocked.micAccess)
+        assertNull(blocked.leaseRootWatchdogArmed)
+    }
+
+    /**
+     * A verified revoke never retires the lease on its own. If the controller block afterwards
+     * cannot be read back, the durable lease, the alarms and the in-memory lease fields all
+     * survive, exactly as they do for any other failed block.
+     */
+    @Test
+    fun `revoked root lease survives a controller block that fails readback`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = true
+        val opened = fixture.coordinator.execute(
+            MicCoordinator.ENDPOINT_TOGGLE,
+            "request-root-revoke-keep-open-01",
+        )
+        assertTrue(opened.ok)
+        fixture.time += 1_000L
+        fixture.events.clear()
+        fixture.controller.blockResultState = MicAccessState.OPEN
+
+        val blocked = fixture.coordinator.execute(
+            MicCoordinator.ENDPOINT_TOGGLE,
+            "request-root-revoke-keep-block-02",
+        )
+
+        assertEquals(listOf("revoke", "block"), fixture.events)
+        assertEquals(1, fixture.lease.revokeCalls)
+        assertEquals(0, fixture.lease.cancelCount)
+        assertFalse(blocked.ok)
+        assertEquals(MicAccessState.OPEN, blocked.micAccess)
+        assertEquals(true, blocked.leaseRootWatchdogArmed)
+        assertEquals(true, blocked.leaseExactAlarmArmed)
+        // A BLOCK operation never reports an auto-block deadline, so the durable lease itself is
+        // the observable proof that the guard survived the failed block.
+        assertEquals(
+            "request-root-revoke-keep-open-01",
+            fixture.lease.activeLease?.requestId,
+        )
+    }
+
+    @Test
+    fun `block without an active lease never runs the root revoke script`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.OPEN,
+            controllerId = "audio_manager",
+        )
+
+        val result = fixture.coordinator.initialize()
+
+        assertEquals(MicAccessState.BLOCKED, result.observed)
+        assertEquals(listOf("block"), fixture.events)
+        assertEquals(0, fixture.lease.revokeCalls)
+        assertEquals(0, fixture.lease.cancelCount)
+    }
+
     @Test
     fun `remote latency covers lease setup and the complete serialized operation`() = runTest {
         val fixture = Fixture(initialState = MicAccessState.BLOCKED)
@@ -942,9 +1066,11 @@ class MicCoordinatorTest {
         var remoteOpenAllowed = true
         var openAllowed = true
         var calibratedState = calibrated
-        val controller = FakeController(initialState, controllerId)
+        /** Ordered record of the controller and lease side effects of one operation. */
+        val events = mutableListOf<String>()
+        val controller = FakeController(initialState, controllerId, events)
         val ledger = MemoryLedger()
-        val lease = FakeLease { time }
+        val lease = FakeLease({ time }, events)
         val snapshots = mutableListOf<BridgeSnapshot>()
         val coordinator = MicCoordinator(
             controller = controller,
@@ -969,6 +1095,7 @@ class MicCoordinatorTest {
     private class FakeController(
         initialState: MicAccessState,
         override val id: String = "fake",
+        private val events: MutableList<String> = mutableListOf(),
     ) : MicController {
         override val displayName = "Fake"
         var state = initialState
@@ -988,6 +1115,7 @@ class MicCoordinatorTest {
 
         override suspend fun block(target: SafetyTarget?): ControlResult {
             blockCount++
+            events += "block"
             blockTargets += target
             state = blockResultState
             return result(MicAccessState.BLOCKED, state)
@@ -998,6 +1126,7 @@ class MicCoordinatorTest {
             authorization: OpenAuthorization,
         ): ControlResult {
             openCount++
+            events += "open"
             beforeOpenMutation()
             openTargets += target
             state = openResultState
@@ -1016,7 +1145,10 @@ class MicCoordinatorTest {
         )
     }
 
-    private class FakeLease(private val now: () -> Long) : LeaseSafety {
+    private class FakeLease(
+        private val now: () -> Long,
+        private val events: MutableList<String> = mutableListOf(),
+    ) : LeaseSafety {
         var armSucceeds = true
         var persistLeaseOnFailedArm = true
         var failCancelWhenNoLease = false
@@ -1026,6 +1158,9 @@ class MicCoordinatorTest {
         var guardHealthy = true
         var guardVerificationCount = 0
         var cancelCount = 0
+        var revokeSucceeds = true
+        var revokeCalls = 0
+        val cancelRootLeaseAlreadyRevoked = mutableListOf<Boolean>()
         var activeLease: ActiveSafetyLease? = null
         var onArm: () -> Unit = {}
         var openValidDurationMs: Long? = null
@@ -1085,8 +1220,20 @@ class MicCoordinatorTest {
             )
         }
 
-        override suspend fun cancel() {
+        override suspend fun revokeRootLeaseAfterVerifiedBlock(): Boolean {
+            revokeCalls++
+            events += "revoke"
+            // Mirrors AutoBlockSafety: the script alone never clears the durable lease or the
+            // alarms, so a failure here must leave the fake's state completely untouched.
+            return revokeSucceeds && activeLease != null
+        }
+
+        override suspend fun cancel() = cancel(rootLeaseAlreadyRevoked = false)
+
+        override suspend fun cancel(rootLeaseAlreadyRevoked: Boolean) {
             cancelCount++
+            cancelRootLeaseAlreadyRevoked += rootLeaseAlreadyRevoked
+            events += "cancel"
             if (failCancelWhenNoLease && activeLease == null) {
                 error("No durable lease exists")
             }

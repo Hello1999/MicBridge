@@ -6,6 +6,7 @@ import com.jack.micbridge.data.ControlResult
 import com.jack.micbridge.data.IdempotencyStore
 import com.jack.micbridge.data.LedgerEntry
 import com.jack.micbridge.data.MicAccessState
+import com.jack.micbridge.data.OperationResult
 import com.jack.micbridge.data.ProbeResult
 import com.jack.micbridge.data.RequestLedger
 import com.jack.micbridge.data.SafetyTarget
@@ -28,6 +29,7 @@ class ApiRouterTest {
 
         assertEquals(200, response.status)
         assertEquals("{\"ok\":true}", response.body)
+        assertFalse(response.body.contains("haptic_pulses"))
         assertEquals(0, fixture.statusReads)
         assertFalse(response.failClosedOnWriteFailure)
         assertFalse(response.failClosedAfterResponse)
@@ -64,6 +66,7 @@ class ApiRouterTest {
         )
 
         assertEquals(400, response.status)
+        assertTrue(response.body.contains("\"haptic_pulses\":3"))
         assertEquals(0, fixture.controller.openCount)
         assertFalse(response.failClosedOnWriteFailure)
         assertFalse(response.failClosedAfterResponse)
@@ -89,9 +92,62 @@ class ApiRouterTest {
         assertTrue(response.body.contains("\"ok\":true"))
         assertTrue(response.body.contains("\"mic_access\":\"open\""))
         assertTrue(response.body.contains("\"request_id\":\"$requestId\""))
+        assertTrue(response.body.contains("\"verified\":true"))
+        assertTrue(response.body.contains("\"haptic_pulses\":1"))
         assertEquals(1, fixture.controller.openCount)
         assertTrue(response.failClosedOnWriteFailure)
         assertFalse(response.failClosedAfterResponse)
+    }
+
+    @Test
+    fun `verified block result pre-computes two haptic pulses`() = runTest {
+        val fixture = Fixture()
+
+        val opened = fixture.router.route(toggle("request-router-pulse-open1"))
+        val blocked = fixture.router.route(toggle("request-router-pulse-block1"))
+
+        assertTrue(opened.body.contains("\"haptic_pulses\":1"))
+        assertEquals(200, blocked.status)
+        assertTrue(blocked.body.contains("\"ok\":true"))
+        assertTrue(blocked.body.contains("\"verified\":true"))
+        assertTrue(blocked.body.contains("\"mic_access\":\"blocked\""))
+        assertTrue(blocked.body.contains("\"haptic_pulses\":2"))
+    }
+
+    @Test
+    fun `open mic access without verification still pre-computes three haptic pulses`() = runTest {
+        val fixture = Fixture(
+            mutationResult = operationResult(
+                ok = true,
+                micAccess = MicAccessState.OPEN,
+                controlReadback = false,
+            ),
+        )
+
+        val response = fixture.router.route(toggle("request-router-unverified-1"))
+
+        assertEquals(200, response.status)
+        assertTrue(response.body.contains("\"mic_access\":\"open\""))
+        assertTrue(response.body.contains("\"verified\":false"))
+        assertTrue(response.body.contains("\"ok\":false"))
+        assertTrue(response.body.contains("\"haptic_pulses\":3"))
+    }
+
+    @Test
+    fun `replayed request with unknown fresh state keeps three haptic pulses`() = runTest {
+        val fixture = Fixture()
+        val requestId = "request-router-replay-001"
+
+        val first = fixture.router.route(toggle(requestId))
+        fixture.controller.state = MicAccessState.UNKNOWN
+        val replayed = fixture.router.route(toggle(requestId))
+
+        assertTrue(first.body.contains("\"haptic_pulses\":1"))
+        assertEquals(200, replayed.status)
+        assertTrue(replayed.body.contains("\"replayed\":true"))
+        assertTrue(replayed.body.contains("\"ok\":false"))
+        assertTrue(replayed.body.contains("\"haptic_pulses\":3"))
+        assertEquals(1, fixture.controller.openCount)
     }
 
     @Test
@@ -114,6 +170,7 @@ class ApiRouterTest {
         assertTrue(response.body.contains("\"ok\":false"))
         assertTrue(response.body.contains("\"request_id\":\"$requestId\""))
         assertTrue(response.body.contains("ACOUSTIC_CALIBRATION_REQUIRED"))
+        assertTrue(response.body.contains("\"haptic_pulses\":3"))
         assertEquals(0, fixture.controller.openCount)
         assertTrue(response.failClosedOnWriteFailure)
         assertFalse(response.failClosedAfterResponse)
@@ -142,8 +199,28 @@ class ApiRouterTest {
         assertTrue(response.body.contains("\"verified\":false"))
         assertTrue(response.body.contains("\"request_id\":\"$requestId\""))
         assertTrue(response.body.contains("INTERNAL_ERROR"))
+        assertTrue(response.body.contains("\"haptic_pulses\":3"))
         assertTrue(response.failClosedOnWriteFailure)
         assertTrue(response.failClosedAfterResponse)
+    }
+
+    @Test
+    fun `verified blocked status reports two haptic pulses`() = runTest {
+        val fixture = Fixture()
+
+        val response = fixture.router.route(
+            request(
+                "GET",
+                ApiRouter.STATUS_PATH,
+                mapOf(ApiRouter.TOKEN_HEADER to "secret"),
+            ),
+        )
+
+        assertEquals(200, response.status)
+        assertTrue(response.body.contains("\"ok\":true"))
+        assertTrue(response.body.contains("\"verified\":true"))
+        assertTrue(response.body.contains("\"mic_access\":\"blocked\""))
+        assertTrue(response.body.contains("\"haptic_pulses\":2"))
     }
 
     @Test
@@ -168,6 +245,7 @@ class ApiRouterTest {
         assertEquals(200, response.status)
         assertTrue(response.body.contains("\"ok\":false"))
         assertTrue(response.body.contains("\"verified\":false"))
+        assertTrue(response.body.contains("\"haptic_pulses\":3"))
     }
 
     @Test
@@ -182,6 +260,8 @@ class ApiRouterTest {
         assertEquals(401, unauthenticated.status)
         assertEquals(404, authenticated.status)
         assertTrue(authenticated.body.contains("NOT_FOUND"))
+        assertTrue(unauthenticated.body.contains("\"haptic_pulses\":3"))
+        assertTrue(authenticated.body.contains("\"haptic_pulses\":3"))
     }
 
     @Test
@@ -198,6 +278,7 @@ class ApiRouterTest {
 
         assertEquals(405, response.status)
         assertTrue(response.body.contains("METHOD_NOT_ALLOWED"))
+        assertTrue(response.body.contains("\"haptic_pulses\":3"))
         assertEquals(0, fixture.controller.openCount)
     }
 
@@ -232,6 +313,33 @@ class ApiRouterTest {
     private fun request(method: String, target: String, headers: Map<String, String> = emptyMap()) =
         HttpRequest(method, target, "HTTP/1.1", headers)
 
+    private fun toggle(requestId: String) = request(
+        "POST",
+        MicCoordinator.ENDPOINT_TOGGLE,
+        mapOf(
+            ApiRouter.TOKEN_HEADER to "secret",
+            ApiRouter.REQUEST_ID_HEADER to requestId,
+        ),
+    )
+
+    private fun operationResult(
+        ok: Boolean,
+        micAccess: MicAccessState,
+        controlReadback: Boolean = true,
+        acousticCalibrationValid: Boolean = true,
+    ) = OperationResult(
+        ok = ok,
+        commandSucceeded = ok,
+        micAccess = micAccess,
+        previous = MicAccessState.BLOCKED,
+        controlReadback = controlReadback,
+        acousticCalibrationValid = acousticCalibrationValid,
+        controllerId = "fake",
+        requestId = null,
+        autoBlockAtEpochMs = null,
+        latencyMs = 1,
+    )
+
     private class Fixture(
         calibrated: Boolean = true,
         private val statusSnapshot: BridgeSnapshot = BridgeSnapshot(
@@ -239,6 +347,7 @@ class ApiRouterTest {
             controlReadback = true,
             acousticCalibrationValid = true,
         ),
+        private val mutationResult: OperationResult? = null,
     ) {
         val controller = FakeController()
         private val ledger = MemoryLedger()
@@ -272,6 +381,10 @@ class ApiRouterTest {
             statusProvider = {
                 statusReads++
                 statusSnapshot
+            },
+            mutationExecutor = { endpoint, requestId, generation ->
+                mutationResult?.copy(requestId = requestId)
+                    ?: coordinator.execute(endpoint, requestId, generation)
             },
         )
     }

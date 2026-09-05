@@ -15,6 +15,7 @@
 | `control_readback` | 控制器是否读回明确状态 |
 | `acoustic_calibration_valid` | 固件、控制器、目标包和 ChatGPT 版本是否仍匹配人工校准 |
 | `request_id` | 修改请求中收到的 ID；iPhone 必须核对完全相等 |
+| `haptic_pulses` | 服务端按 1/2/3 规则预先计算的"振动设备"调用次数；它只是把快捷指令原本要做的多重判断折叠成一个整数，客户端仍必须先确认响应 `request_id` 与本次发送值完全相同，不匹配时一律按 3 次处理。 |
 | `replayed` | 是否命中持久幂等账本且没有再次执行副作用 |
 | `original_outcome` | 重复请求首次执行的结果；自定义振动动作映射不得用它代替当前 `mic_access` |
 | `auto_block_at` | 校准/诊断 OPEN 的 UTC 截止时间；Action Button toggle 持续开放时为 `null` |
@@ -60,6 +61,8 @@ Request ID 是符合上述字符集和长度的 opaque 标识，不要求 RFC UU
 
 从 Android 当前读回切换。`UNKNOWN` 时仅尝试 `BLOCKED`。由 `BLOCKED` 切到 `OPEN` 时采用持续开放，响应中 `auto_block_at=null`；正常情况下只有下一次不同 request ID 的 toggle 才切回 `BLOCKED`。服务重启、监督器失效、权限撤销或受监控网络变化仍会故障安全屏蔽。
 
+响应同时携带 `haptic_pulses`：`ok=true`、`verified=true` 且 `mic_access="open"` 时为 `1`，同样条件下 `mic_access="blocked"` 时为 `2`，其余一切情况（含 `ok=false`、`verified=false`、`unknown`、重放后状态无法读回以及受理后的内部异常）为 `3`。它由服务端用与上表完全相同的字段计算，只为让快捷指令少做几步判断；快捷指令仍必须自行核对响应 `request_id` 与本次发送值完全相同，不匹配或字段缺失/非数字时一律按 3 次处理，不得改用它绕过 `ok`/`verified`/`request_id` 校验。
+
 读回确认并提交成功结果后，Android 异步播放非语音状态提示：`BLOCKED → OPEN` 为短促上扬双音，`OPEN → BLOCKED` 为短促下行双音。播放期间媒体音量临时设为最接近 30% 的系统档位，结束后恢复原值；若用户在提示期间主动调节音量，则不覆盖用户的新值。提示音失败不改变已经提交的控制结果。失败、同 request ID 重放、状态未变化或从 `UNKNOWN` 收敛到安全状态时不播放。
 
 ### `POST /v1/mic/open`
@@ -86,7 +89,7 @@ Request ID 是符合上述字符集和长度的 opaque 标识，不要求 RFC UU
 - 拒绝全部 `Transfer-Encoding` 与无效 `Content-Length`。为兼容 Apple 快捷指令，只接受零字节或最多 64 字节且严格为空 JSON 对象 `{}` 的正文；拒绝其他正文。
 - 不支持 keep-alive、upgrade、代理绝对 URI 或公网监听。
 - 已通过认证和协议校验并受理的修改请求，其业务结果一律装在 HTTP 200 JSON 中；控制/校准失败、`REQUEST_ID_CONFLICT` 和受理后的内部异常均以 `ok=false` 表示，而不是 409/500。认证、请求 ID 格式、HTTP 协议、方法和路径错误仍返回 4xx。无论状态码是否为 200，快捷指令都不得跳过 `ok`、`verified` 和回显 `request_id` 的联合校验。
-- 上述 1/2/3 次是快捷指令在**收到并解析 JSON 后**主动调用“振动设备”的次数，不包括 Action Button 或通知的系统触感。TCP、路由、超时、ATS 或本地网络权限导致“获取 URL 内容”直接中止时，纯快捷指令可能没有任何自定义失败振动；该情形始终是“状态未知”，不得解释为已屏蔽。失败通知默认关闭，实验性 `x-callback-url` 也只能经目标 iPhone 真机验证，不是保证。
+- 上述 1/2/3 次是快捷指令在**收到并解析 JSON 后**主动调用“振动设备”的次数，不包括 Action Button 或通知的系统触感。除 `/healthz` 外，路由产生的每个 JSON 信封都带 `haptic_pulses`，它是服务端按同一规则预算出的同一个 1/2/3（未进入路由的 HTTP 解析错误信封没有该字段，那类响应本来就是 4xx/5xx）；快捷指令可以直接重复该整数，但必须先确认响应 `request_id` 与本次发送值完全相同，字段缺失或不是数字时仍按 3 次处理。它只减少客户端动作数，不放宽任何判定条件。TCP、路由、超时、ATS 或本地网络权限导致“获取 URL 内容”直接中止时，纯快捷指令可能没有任何自定义失败振动；该情形始终是“状态未知”，不得解释为已屏蔽。失败通知默认关闭，实验性 `x-callback-url` 也只能经目标 iPhone 真机验证，不是保证。
 - 只有已认证、通过协议与 request ID 校验且已受理的修改请求，才携带“响应写入失败即 fail closed”的内部策略；因为它可能已经产生副作用，响应丢失时服务会撤销 listener、BLOCK 并安全重绑。受理后的内部异常先尽量写出 HTTP 200 + `ok=false` 信封，无论写出成功与否也执行该边界。未认证请求、HTTP 解析错误、`/healthz`、`/v1/status` 和尚未受理的修改请求，其响应写入失败只关闭连接，不触发全局 BLOCK/rebind。
 - `request_id` 在应用数据生命周期内不会按年龄或行数淘汰。同 ID、同端点只重放；跨端点或令牌轮换后重用同 ID 返回 `REQUEST_ID_CONFLICT`，均不会再次执行副作用。清除应用数据或卸载会连同令牌一起删除这项保证。
 - 不同 request ID 表示两次独立按键意图，不做时间防抖；第二个 toggle 必须读取 Android 当前状态，因此若第一个请求已 OPEN，紧接着的第二个请求仍会执行 BLOCK。

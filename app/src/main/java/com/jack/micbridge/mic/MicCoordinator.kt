@@ -1106,19 +1106,36 @@ class MicCoordinator(
         if (activeLeaseTarget == null) {
             restoreActiveLease(runCatching { leaseSafety.loadActiveLease() }.getOrNull())
         }
-        val leaseWasActive = activeLeaseTarget != null
-        val target = activeLeaseTarget ?: fallbackTarget ?: controller.captureSafetyTarget()
+        val leaseTarget = activeLeaseTarget
+        val leaseWasActive = leaseTarget != null
+        val target = leaseTarget ?: fallbackTarget ?: controller.captureSafetyTarget()
             ?: return controlFailure(
                 MicAccessState.BLOCKED,
                 "CONTROL_CONTEXT_UNKNOWN",
                 "无法确定需要屏蔽的控制目标；保留已有安全租约",
             )
+        // Retiring a Root lease always ends with the locked revoke script, which blocks the
+        // effective gate for every user, verifies a fresh BLOCKED readback and replaces the
+        // lease marker under the root flock. Running it here, before the controller stack,
+        // keeps that ordering guarantee intact and lets the cross-gate controller's own sensor
+        // read observe BLOCKED, so one BLOCK toggle pays for the expensive block-all-users
+        // round trip once instead of twice. A failure is only a lost optimisation: the script
+        // is then simply run again, inside `cancel`, exactly as before.
+        val rootLeaseRevoked =
+            if (leaseTarget != null && leaseTarget.controllerId in ROOT_WATCHDOG_CONTROLLERS) {
+                runCatching { leaseSafety.revokeRootLeaseAfterVerifiedBlock() }
+                    .getOrDefault(false)
+            } else {
+                false
+            }
         val blocked = controller.block(target)
         if (
             leaseWasActive && blocked.controlReadback &&
             blocked.observed == MicAccessState.BLOCKED
         ) {
-            val cancelError = runCatching { leaseSafety.cancel() }.exceptionOrNull()
+            val cancelError = runCatching {
+                leaseSafety.cancel(rootLeaseAlreadyRevoked = rootLeaseRevoked)
+            }.exceptionOrNull()
             if (cancelError == null) {
                 clearActiveLeaseFields()
             } else {
@@ -1128,6 +1145,13 @@ class MicCoordinator(
                 )
             }
         }
+        // A successful revoke followed by a failed `controller.block` deliberately falls through
+        // here with the in-memory lease fields, the durable lease and both alarms untouched, and
+        // is still fail-closed: the effective sensor gate was written BLOCKED and read back
+        // under the flock before the marker was replaced; the short-lived Root watcher exits on
+        // the replaced marker instead of reopening; and the next `hasHealthyActiveLease()` must
+        // fail, because `verifyActiveGuard` compares the durable request id against that same
+        // replaced marker. So this state can only produce another BLOCK, never a surviving OPEN.
         return blocked
     }
 
