@@ -2,6 +2,8 @@
 
 > 当前结论：最终源码构建、JVM 测试、签名/权限检查、Motorola 真机部署、两次 Root boot guard 重启检查、Motorola OEM 自然开机启动，以及 iPhone 快捷指令静态结构/iCloud 同步在下述限定范围内为 `PASS`；双机 P0 与端到端验收仍为 `NOT_RUN — ACOUSTIC_AND_ACTION_BUTTON_TESTS_PENDING`。
 >
+> 2026-09-05 重新打包与部署后作废的行：设备上的旧版由另一台电脑的 Android Debug key 签名，`adb install -r` 返回 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，只能卸载后全新安装。因此下表中依赖旧 APK SHA-256 `403072a6…`、应用数据（令牌、`request_id` 账本、声学校准）或 Root 开机保护的真机 `PASS` 行——包括「目标 Root Android 上最终 Debug APK 安装并启动」、「Android 状态电子提示音与 30% 音量恢复」、「重启默认 BLOCKED」、「Motorola OEM 自启动许可持久化」和「iPhone 快捷指令静态结构与 iCloud 同步」（令牌已失效）——一律降级为 `NOT_RUN`，必须按新 APK（30,627,266 bytes，SHA-256 `ccbeb01a…`）重跑。卸载时已终止残留 boot supervisor/failsafe 进程并删除 `/data/adb/service.d/micbridge-failsafe.sh` 与 `/data/adb/micbridge`；全程 `mic mute FromApi=true`、8 个 `sensor_privacy` toggle 均为 BLOCKED。全新安装后设备 `base.apk` SHA-256 与本地产物一致、前台服务运行、`8787` 按 fail-closed 未监听。
+>
 > API 37 / Android 17 Pixel_10_Pro AVD 的 13/13 仪器测试、安装、冷启动和无 Root 时 fail-closed 结果来自较早源码快照，未对当前最终源码重新运行，不能作为最终 APK 的模拟器验证。ChatGPT Live 声学、物理锁屏/熄屏与 Doze、Action Button 实际运行、1/2/3 次触感和故障注入继续保持 `NOT_RUN`。
 
 ## 构建主机
@@ -84,5 +86,9 @@
 | 可靠模式耗电 | NOT_RUN | 默认以 1 小时锁、45 分钟续取方式接近连续持有 Partial WakeLock；需真机对照 |
 | 审计证据取得 | NOT_RUN | 无应用内导出；使用最近 20 条 UI 截图或经授权 ADB/Root 提取最多 100 条 SQLite 记录 |
 | 来电影响 | NOT_RUN | 需真机且不得影响紧急呼叫 |
+| 打开 App/回到前台不改变麦克风状态 | NOT_RUN | 2026-09-05 UI 调整后的行为；需在 OPEN 状态下真机验证（测试计划 U-01/U-02） |
+| 应用内“测试切换”与 iPhone 路径一致 | NOT_RUN | 审计来源 `local-ui`；需真机验证（测试计划 U-03） |
+| 校准失效原因在状态区可见 | NOT_RUN | 更新 ChatGPT 后应显示具体原因；需真机验证（测试计划 U-04） |
+| 热路径优化后的 Root 往返与延迟 | NOT_RUN | 审计 `root_round_trips`、`latency_ms` p50/最大；调整后源码尚未部署 |
 
 完整步骤与证据格式见 [REAL_DEVICE_TEST_PLAN_ZH.md](REAL_DEVICE_TEST_PLAN_ZH.md)。设备连接后必须把本文件复制为带设备代号的记录，填写 Git commit、上述最终 APK SHA-256、命令输出摘要、屏幕录像/截图编号与人工签字。

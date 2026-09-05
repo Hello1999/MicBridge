@@ -64,6 +64,28 @@ data class BridgeSnapshot(
     val lastError: String? = null,
     val lastLatencyMs: Long? = null,
     val observedAtEpochMs: Long? = null,
+    /** True only while the calibration-only Root isolation split state exists. */
+    val calibrationIsolationActive: Boolean = false,
+    /** Human-readable reason the acoustic calibration is not usable; null when valid. */
+    val calibrationInvalidReason: String? = null,
+    /** Number of Root shell round-trips consumed by the most recent coordinator operation. */
+    val rootRoundTripsLastOperation: Int? = null,
+    val readiness: ReadinessSnapshot = ReadinessSnapshot(),
+)
+
+/**
+ * Per-gate readiness for the UI checklist. Every field mirrors one admission condition the
+ * service evaluates before it allows a remote OPEN; the snapshot is informational and never
+ * substitutes for the fresh checks performed inside the coordinator.
+ */
+data class ReadinessSnapshot(
+    val rootAvailable: Boolean? = null,
+    val notificationPermitted: Boolean? = null,
+    val localNetworkPermitted: Boolean? = null,
+    val exactAlarmPermitted: Boolean? = null,
+    val reliableModeReady: Boolean? = null,
+    val userForeground: Boolean? = null,
+    val rootBootGuardInstalled: Boolean? = null,
 )
 
 data class OperationResult(

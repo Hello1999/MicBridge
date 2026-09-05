@@ -44,12 +44,28 @@ class MicCoordinator(
     private var activeLeasePersistent = false
     private var calibrationIsolationActive = false
 
-    suspend fun activeRootGuardHealthy(): Boolean = mutex.withLock {
-        if (state !is BridgeMicState.Open || activeLeaseRootWatchdogArmed != true) {
-            return@withLock true
+    /**
+     * Periodic Root health proof for the active OPEN lease. Only the lease identity is read
+     * under the coordinator mutex; the Root round-trip itself runs outside it so the 250 ms
+     * monitor can never delay an incoming toggle. A lease that changed while the proof was in
+     * flight was freshly verified inside its own OPEN transaction, so a stale proof is not
+     * evidence against it; the next monitor tick re-verifies the new lease.
+     */
+    suspend fun activeRootGuardHealthy(): Boolean {
+        val requestId = mutex.withLock {
+            if (state !is BridgeMicState.Open || activeLeaseRootWatchdogArmed != true) {
+                return true
+            }
+            activeLeaseRequestId ?: return false
         }
-        val requestId = activeLeaseRequestId ?: return@withLock false
-        leaseSafety.verifyActiveGuard(requestId)
+        val healthy = runCatching { leaseSafety.verifyActiveGuard(requestId) }.getOrDefault(false)
+        return mutex.withLock {
+            if (state !is BridgeMicState.Open || activeLeaseRootWatchdogArmed != true) {
+                return@withLock true
+            }
+            if (activeLeaseRequestId != requestId) return@withLock true
+            healthy
+        }
     }
     suspend fun initialize(): ControlResult = mutex.withLock {
         restoreActiveLease(runCatching { leaseSafety.loadActiveLease() }.getOrNull())
@@ -90,11 +106,12 @@ class MicCoordinator(
         endpoint: String,
         requestId: String,
         remoteGeneration: Long = 0L,
+        auditSource: String = endpoint,
     ): OperationResult {
         val operationStartedNanos = nanoTime()
         return mutex.withLock {
         val recordRemote: (OperationResult) -> OperationResult = { result ->
-            record(endpoint, result, operationStartedNanos)
+            record(auditSource, result, operationStartedNanos)
         }
         val now = nowEpochMs()
         when (val begin = ledger.begin(requestId, endpoint, tokenGeneration(), now)) {
@@ -461,7 +478,11 @@ class MicCoordinator(
                 "服务正在停止或安全权限不可用；已拒绝开放并优先尝试屏蔽",
             )
         }
-        if (target == MicAccessState.OPEN && requireCalibration && !calibrationValid()) {
+        // Calibration identity is a PackageManager/signing-certificate query. It is evaluated
+        // freshly at three boundaries only: entry, the last instruction before the controller
+        // OPEN, and the final commit. Intermediate checks reuse the nearest fresh value.
+        val calibrationAtEntry = !requireCalibration || calibrationValid()
+        if (target == MicAccessState.OPEN && !calibrationAtEntry) {
             val safetyBlock = blockThenCancelLeaseIfVerified()
             updateStateFrom(safetyBlock, null)
             return operationFrom(
@@ -665,7 +686,7 @@ class MicCoordinator(
                     val generationAllowedAtDispatch =
                         remoteGeneration == null || remoteOpenAllowed(remoteGeneration)
                     val calibrationAllowedAtDispatch =
-                        !requireCalibration || calibrationValid()
+                        calibrationAtEntry && (!requireCalibration || calibrationValid())
                     if (
                         !lifecycleAllowedAtDispatch ||
                         !generationAllowedAtDispatch ||
@@ -690,8 +711,7 @@ class MicCoordinator(
                         val lifecycleAllowedAfterOpen = openAllowed()
                         val generationAllowedAfterOpen =
                             remoteGeneration == null || remoteOpenAllowed(remoteGeneration)
-                        val calibrationAllowedAfterOpen =
-                            !requireCalibration || calibrationValid()
+                        val calibrationAllowedAfterOpen = calibrationAllowedAtDispatch
                         val leaseAllowedAfterOpen = hasValidActiveLease()
                         val rootGuardAllowedAfterOpen =
                             activeLeaseRootWatchdogArmed != true ||
@@ -761,15 +781,16 @@ class MicCoordinator(
             val deadlineStillValid = hasValidActiveLease()
             val lifecycleStillAllowed = openAllowed()
             val calibrationAtCommit = !requireCalibration || calibrationValid()
-            val rootGuardStillHealthy =
-                activeLeaseRootWatchdogArmed != true ||
-                    leaseSafety.verifyActiveGuard(requestId)
+            // The PID-bound Root guard was proven inside the mutation lock immediately after
+            // the OPEN readback, and the coordinator mutex is still held here, so nothing can
+            // have replaced the lease since. Repeating that Root round-trip only added latency;
+            // the in-lock proof is the commit proof. The periodic health monitor and every
+            // later status read still re-verify the guard independently.
             if (
                 !lifecycleStillAllowed ||
                 !generationStillAllowed ||
                 !calibrationAtCommit ||
-                !deadlineStillValid ||
-                !rootGuardStillHealthy
+                !deadlineStillValid
             ) {
                 val safetyBlock = blockThenCancelLeaseIfVerified()
                 updateStateFrom(safetyBlock, null)
@@ -784,8 +805,6 @@ class MicCoordinator(
                         "REMOTE_GENERATION_REVOKED"
                     } else if (!calibrationAtCommit) {
                         "ACOUSTIC_CALIBRATION_REVOKED"
-                    } else if (!rootGuardStillHealthy) {
-                        "LEASE_GUARD_UNHEALTHY"
                     } else {
                         "LEASE_EXPIRED_DURING_OPEN"
                     },
@@ -795,8 +814,6 @@ class MicCoordinator(
                         "HTTP 监听代次已失效；开放后已立即优先尝试屏蔽"
                     } else if (!calibrationAtCommit) {
                         "声学校准在开放确认前失效；已立即优先尝试屏蔽"
-                    } else if (!rootGuardStillHealthy) {
-                        "Root 租约监督器在开放确认前失去健康证明；已立即优先尝试屏蔽"
                     } else {
                         "安全租约在开放确认前已到期；已立即优先尝试屏蔽"
                     },
@@ -1052,6 +1069,7 @@ class MicCoordinator(
         lastError = error,
         lastLatencyMs = latency,
         observedAtEpochMs = nowEpochMs(),
+        calibrationIsolationActive = calibrationIsolationActive,
     )
 
     /**

@@ -191,7 +191,11 @@ class AutoBlockSafety(
     }
 
     override suspend fun cancel() = mutationGate.withLock {
-        check(ownsRootWorkspace()) {
+        // The owner marker is immutable for the life of this process once claimed at service
+        // initialization (the same shortcut armWhileLocked already takes), so the extra Root
+        // round-trip on every BLOCK adds latency without adding evidence. The revoke script
+        // below still re-checks the owner file under the Root flock before touching the lease.
+        check(rootWorkspaceClaimed || ownsRootWorkspace()) {
             "Current Android user does not own the Root safety workspace"
         }
         val active = leaseStore.load()

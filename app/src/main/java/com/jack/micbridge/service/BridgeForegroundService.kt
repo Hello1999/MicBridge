@@ -63,7 +63,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.CopyOnWriteArraySet
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import com.jack.micbridge.data.ReadinessSnapshot
 
 class BridgeForegroundService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -91,6 +93,16 @@ class BridgeForegroundService : Service() {
     private val micAsyncClaimedEvent = AtomicLong(0L)
     private val micRemoteVerifiedEvent = AtomicLong(0L)
     private val coordinatorSnapshotEpoch = AtomicLong(0L)
+    private val rootRoundTripCounter = AtomicInteger(0)
+    @Volatile
+    private var operationRootRoundTripStart = 0
+    @Volatile
+    private var lastOperationRootRoundTrips: Int? = null
+    @Volatile
+    private var rootAvailable: Boolean? = null
+    private val notificationThrottleLock = Any()
+    private var lastNotificationEpochMs = 0L
+    private var pendingNotificationJob: Job? = null
     private val taskRemovalLock = Any()
     private val maintenanceBoundaryLock = Any()
     private var maintenanceBoundaryGeneration = 0L
@@ -244,7 +256,12 @@ class BridgeForegroundService : Service() {
         bootIncidentStore = BootIncidentStore(this)
         auditLog = AuditLogRepository(this)
         stateChangeSoundPlayer = StateChangeSoundPlayer(this)
-        rootShell = RootShell(onDiagnostic = auditLog::appendRoot)
+        rootShell = RootShell(
+            onDiagnostic = { diagnostic ->
+                rootRoundTripCounter.incrementAndGet()
+                auditLog.appendRoot(diagnostic)
+            },
+        )
         val startingSnapshot = ServiceRuntime.snapshot.value.copy(
             micAccess = MicAccessState.UNKNOWN,
             transitioning = false,
@@ -374,6 +391,7 @@ class BridgeForegroundService : Service() {
         } else {
             scope.launch {
                 try {
+                operationRootRoundTripStart = rootRoundTripCounter.get()
                 if (!awaitInitialized()) {
                     val blocked = com.jack.micbridge.safety.DirectBootFailsafeBlocker.block(
                         applicationContext,
@@ -560,6 +578,36 @@ class BridgeForegroundService : Service() {
                         completeCalibrationSafely(calibrationGenerationAtDispatch)
                     }
                     ACTION_REFRESH -> publishCurrent()
+                    ACTION_TOGGLE -> {
+                        // The in-app test button takes exactly the iPhone path: same ledger,
+                        // same calibration gate, same lease arming and the same listener
+                        // generation checks. If it fails here it would fail from the Shortcut.
+                        val requestId = "local-ui-" +
+                            java.util.UUID.randomUUID().toString().replace("-", "")
+                        val toggle = try {
+                            executeGuardedMutation(
+                                MicCoordinator.ENDPOINT_TOGGLE,
+                                requestId,
+                                activeRemoteGeneration,
+                                "local-ui",
+                            )
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (failure: Throwable) {
+                            val failureEvent =
+                                networkRefreshEvents.advance(::revokeAndCloseHttpServersLocked)
+                            handleHttpFailure(
+                                "测试切换在提交前检测到麦克风漂移（${failure.javaClass.simpleName}）",
+                                failureEvent,
+                            )
+                            null
+                        }
+                        if (toggle != null && !toggle.ok) {
+                            publishCurrent(
+                                toggle.errorMessage ?: toggle.errorCode ?: "测试切换失败",
+                            )
+                        }
+                    }
                     ACTION_INSTALL_GUARD -> {
                         val blocked = coordinator.localBlock("install-guard")
                         val installed =
@@ -703,7 +751,11 @@ class BridgeForegroundService : Service() {
                 },
                 elapsedRealtimeMs = SystemClock::elapsedRealtime,
                 onSnapshot = ::onCoordinatorSnapshot,
-                onOperation = auditLog::append,
+                onOperation = { source, result ->
+                    val roundTrips = rootRoundTripCounter.get() - operationRootRoundTripStart
+                    lastOperationRootRoundTrips = roundTrips
+                    auditLog.append(source, result, "root_round_trips=$roundTrips")
+                },
             )
         }
         val startupBlock = coordinator.initialize()
@@ -718,6 +770,7 @@ class BridgeForegroundService : Service() {
                 "已配置的 Root 开机保护无法在服务启动时刷新"
             }
         }
+        rootAvailable = runCatching { rootShell.hasRoot() }.getOrDefault(false)
         val probe = controller.probe()
         controllerProbeSummary = buildString {
             append("available=${probe.available}, readable=${probe.stateReadable}, locked=")
@@ -821,12 +874,7 @@ class BridgeForegroundService : Service() {
         // Wake monitors before notification Binder work. This closes the cold-start/idle race
         // where a short OPEN lease could otherwise begin during a long idle delay.
         wakeSafetyMonitors()
-        val merged = snapshot.copy(
-            serviceRunning = true,
-            controllerProbe = controllerProbeSummary ?: snapshot.controllerProbe,
-            batteryOptimizationExempt = isBatteryOptimizationExempt(),
-            serverAddresses = boundAddresses,
-        )
+        val merged = enrich(snapshot).copy(serverAddresses = boundAddresses)
         try {
             if (publishAndNotifyIfActive(merged)) {
                 scheduleInProcessAutoBlock(merged.autoBlockAtEpochMs)
@@ -934,20 +982,36 @@ class BridgeForegroundService : Service() {
         endpoint: String,
         requestId: String,
         generation: Long,
+    ): OperationResult = executeGuardedMutation(endpoint, requestId, generation, endpoint)
+
+    private suspend fun executeGuardedMutation(
+        endpoint: String,
+        requestId: String,
+        generation: Long,
+        auditSource: String,
     ): OperationResult = remoteRequestMutex.withLock {
         remoteRequestInFlight = true
+        operationRootRoundTripStart = rootRoundTripCounter.get()
         try {
-            val result = coordinator.execute(endpoint, requestId, generation)
+            val result = coordinator.execute(endpoint, requestId, generation, auditSource)
             if (!result.ok) return@withLock result
 
             var checks = 0
             while (micTransitionEventCounter.get() > micRemoteVerifiedEvent.get()) {
                 val event = micTransitionEventCounter.get()
-                val checked = coordinator.readSnapshot(true, boundAddresses)
+                // The transition-time broadcast is AudioManager's own mute-change event. The
+                // Root gates were freshly read inside the coordinator mutex a moment ago and
+                // cannot be the source of this broadcast, so the commit check re-reads only the
+                // gate the broadcast is about. This keeps "no success response before a fresh
+                // read agrees" without spending another Root round-trip per toggle.
+                val audioBlocked = runCatching { audioManager.isMicrophoneMute }.getOrNull()
                 micRemoteVerifiedEvent.updateAndGet { prior -> maxOf(prior, event) }
                 micAsyncClaimedEvent.updateAndGet { prior -> maxOf(prior, event) }
-                val agrees = checked.controlReadback && checked.lastError == null &&
-                    checked.micAccess == result.micAccess
+                val agrees = when (result.micAccess) {
+                    MicAccessState.BLOCKED -> audioBlocked == true
+                    MicAccessState.OPEN -> audioBlocked == false
+                    MicAccessState.UNKNOWN -> false
+                }
                 if (!agrees) {
                     remoteMutationFenceActive = true
                     try {
@@ -1126,12 +1190,7 @@ class BridgeForegroundService : Service() {
         val router = ApiRouter(
             tokenMatches = settings::tokenMatches,
             coordinator = coordinator,
-            statusProvider = {
-                coordinator.readSnapshot(true, boundAddresses).copy(
-                    controllerProbe = controllerProbeSummary,
-                    batteryOptimizationExempt = isBatteryOptimizationExempt(),
-                )
-            },
+            statusProvider = { enrich(coordinator.readSnapshot(true, boundAddresses)) },
             remoteGeneration = generation,
             onStatus = auditLog::appendStatus,
             mutationExecutor = ::executeRemoteMutation,
@@ -1451,12 +1510,43 @@ class BridgeForegroundService : Service() {
     private suspend fun publishCurrent(overrideError: String? = null) {
         if (!initialized) return
         val current = coordinator.readSnapshot(true, boundAddresses).let {
-            val enriched = it.copy(batteryOptimizationExempt = isBatteryOptimizationExempt())
-                .copy(controllerProbe = controllerProbeSummary)
+            val enriched = enrich(it)
             if (overrideError == null) enriched else enriched.copy(lastError = overrideError)
         }
         publishAndNotifyIfActive(current)
     }
+
+    /**
+     * Attaches service-level readiness facts to a coordinator snapshot. These fields are for
+     * the UI checklist and notification text only; every admission decision still uses the
+     * fresh checks inside `openAllowed`/`remoteOpenAllowed`.
+     */
+    private fun enrich(snapshot: BridgeSnapshot): BridgeSnapshot = snapshot.copy(
+        serviceRunning = true,
+        controllerProbe = controllerProbeSummary ?: snapshot.controllerProbe,
+        batteryOptimizationExempt = isBatteryOptimizationExempt(),
+        // The coordinator already evaluated calibration validity for this snapshot. Only the
+        // (rare) invalid case pays for the PackageManager comparison that names the cause, so the
+        // successful toggle path does not regain the per-snapshot identity query removed above.
+        calibrationInvalidReason = if (snapshot.acousticCalibrationValid) {
+            null
+        } else {
+            runCatching { settings.acousticCalibrationInvalidReason() }
+                .getOrDefault("校准状态无法读取")
+        },
+        rootRoundTripsLastOperation = lastOperationRootRoundTrips,
+        readiness = ReadinessSnapshot(
+            rootAvailable = rootAvailable,
+            notificationPermitted = hasVisibleNotificationPermission(),
+            localNetworkPermitted = hasLocalNetworkPermission(),
+            exactAlarmPermitted = runCatching {
+                getSystemService(android.app.AlarmManager::class.java).canScheduleExactAlarms()
+            }.getOrDefault(false),
+            reliableModeReady = isReliabilityReady(),
+            userForeground = isAppUserForeground(),
+            rootBootGuardInstalled = settings.rootBootGuardInstalled,
+        ),
+    )
 
     private suspend fun completeCalibrationSafely(calibrationGeneration: Long) {
         // Finalization always establishes BLOCKED first. This makes the first later remote
@@ -2054,7 +2144,41 @@ class BridgeForegroundService : Service() {
             true
         }
 
+    /**
+     * Intermediate `transitioning` snapshots arrive several times within one toggle. Each
+     * notify() is a synchronous Binder call on the operation's own thread, so they are coalesced:
+     * a transitioning update is posted immediately only if the previous post is older than
+     * [NOTIFICATION_THROTTLE_MS]; otherwise one trailing update is scheduled. Final states
+     * (not transitioning, or carrying an error) always post immediately and cancel any pending
+     * trailing update so the notification never lags behind the committed state.
+     */
     private fun updateNotificationUnconditionally(snapshot: BridgeSnapshot) {
+        val now = SystemClock.elapsedRealtime()
+        val throttle = snapshot.transitioning && snapshot.lastError == null
+        synchronized(notificationThrottleLock) {
+            pendingNotificationJob?.cancel()
+            pendingNotificationJob = null
+            if (throttle && now - lastNotificationEpochMs < NOTIFICATION_THROTTLE_MS) {
+                val delayMs = NOTIFICATION_THROTTLE_MS - (now - lastNotificationEpochMs)
+                pendingNotificationJob = scope.launch {
+                    delay(delayMs)
+                    synchronized(publicationLock) {
+                        if (terminalPublication) return@synchronized
+                        val latest = ServiceRuntime.snapshot.value
+                        synchronized(notificationThrottleLock) {
+                            lastNotificationEpochMs = SystemClock.elapsedRealtime()
+                        }
+                        postNotification(latest)
+                    }
+                }
+                return
+            }
+            lastNotificationEpochMs = now
+        }
+        postNotification(snapshot)
+    }
+
+    private fun postNotification(snapshot: BridgeSnapshot) {
         getSystemService(NotificationManager::class.java).notify(
             NOTIFICATION_ID,
             notification(snapshot),
@@ -2322,6 +2446,7 @@ class BridgeForegroundService : Service() {
             "com.jack.micbridge.CALIBRATION_CONFIRM_AND_BLOCK"
         const val ACTION_COMPLETE_CALIBRATION = "com.jack.micbridge.COMPLETE_CALIBRATION"
         const val ACTION_REFRESH = "com.jack.micbridge.REFRESH"
+        const val ACTION_TOGGLE = "com.jack.micbridge.TOGGLE"
         const val ACTION_INSTALL_GUARD = "com.jack.micbridge.INSTALL_GUARD"
         const val ACTION_REMOVE_GUARD = "com.jack.micbridge.REMOVE_GUARD"
         const val ACTION_STOP = "com.jack.micbridge.STOP"
@@ -2340,6 +2465,7 @@ class BridgeForegroundService : Service() {
         private const val NETWORK_SETTLE_MS = 500L
         private const val NETWORK_MONITOR_RETRY_MS = 1_000L
         private const val COUNTDOWN_TICK_MS = 1_000L
+        private const val NOTIFICATION_THROTTLE_MS = 150L
         private const val MAX_TRANSITION_EVENT_COMMIT_CHECKS = 3
         private const val OPEN_ADDRESS_MONITOR_INTERVAL_MS = 250L
         private const val MISSING_ADDRESS_MONITOR_INTERVAL_MS = 2_000L

@@ -91,6 +91,10 @@ Request ID 是符合上述字符集和长度的 opaque 标识，不要求 RFC UU
 - `request_id` 在应用数据生命周期内不会按年龄或行数淘汰。同 ID、同端点只重放；跨端点或令牌轮换后重用同 ID 返回 `REQUEST_ID_CONFLICT`，均不会再次执行副作用。清除应用数据或卸载会连同令牌一起删除这项保证。
 - 不同 request ID 表示两次独立按键意图，不做时间防抖；第二个 toggle 必须读取 Android 当前状态，因此若第一个请求已 OPEN，紧接着的第二个请求仍会执行 BLOCK。
 
+## 审计来源
+
+审计记录的 `source` 为 `/v1/mic/toggle`、`/v1/mic/open`、`/v1/mic/block`（远程）、`local-ui`（应用内测试切换，走同一受保护路径）、`http-status`、`notification`、`calibration` 等；`diagnostic` 字段自 2026-09-05 起对每次 coordinator 操作附带 `root_round_trips=N`。
+
 ## curl 示例
 
 PowerShell 7：

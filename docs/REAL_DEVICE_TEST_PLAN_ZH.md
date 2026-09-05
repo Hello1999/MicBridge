@@ -137,6 +137,8 @@ P0 通过要求：三种屏幕状态均完成 20 个周期，零次错误状态�
 
 上述 20 周期是人工真机验收，UI 不会自动计数；测试人员必须先保留证据，再勾选对应声学声明。只有下列严格序列在**同一次前台服务会话**中完成，已保存校准才可标记有效：
 
+UI 以向导显示四步：当前步骤由已发布快照推导（临时 OPEN 带 `auto_block_at` 且 Root watcher 已布防 → 第 2 步；显式隔离标志 → 第 3 步；新鲜 BLOCKED 且已勾选隔离确认 → 第 4 步），非当前步骤的按钮置灰。这只是引导；服务对每一步仍独立复核。
+
 1. 点击“1. 临时开放用于测试”。此动作先清空本服务会话中旧轮的 OPEN/隔离/BLOCK 证据；只有新鲜确认 OPEN，且双精确 Alarm 与 Root watcher 都已布防，本轮才进入 OPEN 阶段。
 2. 点击“2. 仅用 Root 屏蔽（隔离校验）”。应用必须新鲜读回 `sensor_privacy=BLOCKED`、`AudioManager=OPEN`、AppOps 为已确认非显式否决 mode（只读且非 UNKNOWN），且租约/Root guard 仍健康。隔离期间合并公开状态故意为 UNKNOWN；这是校准专用 split，不是可对外声称的 BLOCKED。
 3. 在 split 状态尚存在时，说出本轮唯一测试语句，确认 ChatGPT 没有听到，勾选隔离确认后立即点击“3. 确认无收音并立即完整屏蔽”。点击时应用会再次读回 split 四项条件；只有它们仍匹配才接受人工确认，随后立即执行完整 BLOCK 并在确认两个门均已屏蔽后清理租约。
@@ -269,7 +271,7 @@ Action Button 成功 OPEN 时 `auto_block_at` 必须为 `null`、`lease_exact_al
 
 通过条件：等待期内没有 timer/Alarm 自动 BLOCK，第二次 toggle 才屏蔽；同时验证服务重启、watcher/supervisor 失效、权限撤销和受监控网络变化仍会 fail closed。校准/诊断路径另行保留原有到期测试。
 
-活动 OPEN 期间还必须采证两层持续健康监督：Root supervisor 约每 200 ms 核对 procfs/lease/watcher 轻量状态并约每秒复查 user/profile，应用进程每 250 ms 请求一次新鲜 Root 健康证明。lease 中的应用 PID/starttime、supervisor 的 PID/starttime、boot generation、watcher PID/命令行/状态任一不匹配，都应撤销 HTTP、执行全局 BLOCK/readback 并结束该 lease。`lease_root_watchdog_armed=true` 只证明初始布防，不能替代这些故障注入证据。
+活动 OPEN 期间还必须采证两层持续健康监督：Root supervisor 约每 200 ms 核对 procfs/lease/watcher 轻量状态并约每秒复查 user/profile，应用进程每 250 ms 请求一次新鲜 Root 健康证明（Root 命令在 coordinator 锁外执行，完成后核对 lease 身份未变）。lease 中的应用 PID/starttime、supervisor 的 PID/starttime、boot generation、watcher PID/命令行/状态任一不匹配，都应撤销 HTTP、执行全局 BLOCK/readback 并结束该 lease。`lease_root_watchdog_armed=true` 只证明初始布防，不能替代这些故障注入证据。
 
 ### 9.2 重置、取消和竞态
 
@@ -279,6 +281,16 @@ Action Button 成功 OPEN 时 `auto_block_at` 必须为 `null`、`lease_exact_al
 - 原 lease 的 Alarm 到期后必须正常 BLOCK；不得因为重复 `/open` 而被替换或失效。BLOCKED 后新发起的 OPEN 才能创建新 lease，接收器必须核对当前 lease ID。
 - 修改系统墙钟、时区后，单调 exact Alarm 仍应在响应的 `auto_block_at` 对应单调边界触发；深度休眠下 RTC AlarmClock 也应在同一授权截止点触发。两种 PendingIntent 均须采证，且默认配置下不应等到 30 秒硬截止才开始。
 - 无精确闹钟能力、Alarm 创建失败或持久化失败时，OPEN 必须失败或按产品声明进入明确降级；不得仍返回完全验证的 OPEN。
+
+### 9.3 App 前台切换与应用内测试切换
+
+| 编号 | 操作 | 期望 | 结果 |
+|---|---|---|---|
+| U-01 | OPEN 状态下打开 MicBridge 页面、按 Home 再返回 | 状态保持 OPEN，HTTP 监听地址不变，审计只多出 `http-status`/无新 BLOCK 记录 | `NOT_RUN` |
+| U-02 | 从页面上的“电池设置/闹钟设置/应用详情”返回 | 执行一次先 BLOCK 再重扫（信任边界重置），状态区说明原因 | `NOT_RUN` |
+| U-03 | 点击“测试：开放”“测试：静音”各 20 次 | 审计来源为 `local-ui`，行为与 iPhone toggle 完全一致；校准失效时同样返回 `ACOUSTIC_CALIBRATION_REQUIRED` | `NOT_RUN` |
+| U-04 | 更新 ChatGPT 后打开页面 | 状态区显示“快捷指令会失败（3 次振动）：ChatGPT 已更新，需要重新校准”，就绪检查该项为 ✗ | `NOT_RUN` |
+| U-05 | OPEN 期间连续 toggle | 250 ms 健康核验不得使 `latency_ms` 出现整次 Root 命令量级的抖动；记录审计 `root_round_trips` | `NOT_RUN` |
 
 ## 10. 生命周期与故障注入
 
@@ -349,7 +361,7 @@ L-02 应在以下崩溃窗口分别注入：
 1. 使用 Action Button 完成至少 50 次切换；每次在 iPhone 快捷指令起点和得到响应处分时。
 2. 统计成功请求的 p50、p95、最大值；网络失败和 UNKNOWN 单独统计，不得从样本中静默删除。
 3. 目标：私有局域网内 p95 小于 1 秒，且快捷指令主动振动动作数零次与 Android 新鲜读回映射不一致；系统触感作为独立观察项，不混入该判定。
-4. 服务器 `latency_ms` 只用于分解 Android 处理时间，不能代替端到端指标。
+4. 服务器 `latency_ms` 只用于分解 Android 处理时间，不能代替端到端指标。审计记录 `diagnostic` 中的 `root_round_trips=N` 给出该次操作的 Root 往返次数；诊断卡显示最近 20 条成功 toggle 的 p50/最大 `latency_ms`。BLOCKED→OPEN 预期约 7 次、OPEN→BLOCKED 预期约 5 次 Root 往返；显著更多说明重试或 fail-closed 回滚。
 5. 稳定空闲 30 分钟并继续做较长时段耗电测试。可靠模式默认使前台服务以“1 小时超时、45 分钟续取”方式接近连续持有 Partial WakeLock；这不是泄漏判定的充分条件，但必须记录为明确耗电策略。关闭可靠模式并重启服务后再做对照。
 6. 分开记录 OPEN 活动窗口与 BLOCKED 稳态的 CPU/电量：活动期预期存在 250 ms 应用健康检查、250 ms 地址检查、约 200 ms Root supervisor 轻量检查与约 1 秒 user/profile 发现；BLOCKED 稳态 supervisor 应降为 1 秒轮询，但每轮仍必须重新发现 user/profile。注入空闲期新建/切换用户，确认不晚于下一轮发现后执行全局 BLOCK/readback；若活动检查在 BLOCKED 后未降频、空闲多用户发现慢于 1 秒、Root supervisor 异常重启循环或产生持续高负载，不得通过稳定性验收。
 
@@ -377,7 +389,9 @@ L-02 应在以下崩溃窗口分别注入：
 | 默认 30 秒硬窗口 | `auto_block_at` 通常约 20 秒开始 BLOCK，绝不晚于硬截止；验证 60 秒执行尾窗、90 秒 wake-lock 裕量及正常提前取消 | `NOT_RUN` | 待填写 |
 | 进程 kill 后备 | 租约内 BLOCK | `NOT_RUN` | 待填写 |
 | Task Manager Stop 后备 | 不依赖回调，租约内 BLOCK | `NOT_RUN` | 待填写 |
-| Root watcher/supervisor 身份或健康异常 | 应用 250 ms 核验或 Root supervisor 先撤权并 BLOCK；双 Alarm 仍独立兜底；armed 字段只证明初始布防 | `NOT_RUN` | 待填写 |
+| 打开 App / 回到前台不改变状态；系统设置返回触发重扫 | U-01/U-02 | `NOT_RUN` | 待填写 |
+| 应用内测试切换与 iPhone 路径一致 | U-03 | `NOT_RUN` | 待填写 |
+| Root watcher/supervisor 身份或健康异常 | 应用 250 ms 核验（锁外 Root 命令）或 Root supervisor 先撤权并 BLOCK；双 Alarm 仍独立兜底；armed 字段只证明初始布防 | `NOT_RUN` | 待填写 |
 | Force Stop | 按所选安全层级验收 | `NOT_RUN` | 待填写 |
 | 重启默认状态 | 不恢复 OPEN | `NOT_RUN` | 待填写 |
 | 绑定接口丢失 | 立即进入 BLOCK | `NOT_RUN` | 待填写 |

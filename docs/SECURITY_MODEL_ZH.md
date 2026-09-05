@@ -273,7 +273,7 @@ RTC AlarmClock 是 Android 文档中不会被系统调整、且会使系统退�
 
 当前 Debug 实现会部署版本化 `service.d` 开机脚本和常驻 generation supervisor。Action Button 的 watcher 无单调截止时间，保持到 lease 标记被下一次 BLOCK 替换；校准/诊断 watcher 仍按 `/proc/uptime` 截止时间运行并使用带超时的 kernel wake lock。两种 watcher 都固定 controller/user/target，以 `flock` 协调 lease/boot generation，且健康校验失败都拒绝或撤销 OPEN。
 
-supervisor 将应用 PID/starttime、自己的 PID/starttime、不可变 generation 和 watcher PID/命令行/状态纳入活动 lease 健康检查。活动期约 200 ms 检查轻量进程/文件状态，框架 user/profile 发现约每秒一次；应用进程另以 250 ms 周期调用 Root 新鲜核验。任何无法确认都封闭 lease 并 BLOCK，而不是用同一 OPEN 授权静默拉起新 watcher。无活动 lease 时 supervisor 以 1 秒周期运行，且每轮都重新发现 user/profile；发现空闲期上下文变化时先对新全集执行全局 BLOCK/readback，再更新基线。这是实现证据，不是目标设备通过证据；必须对目标 Root 管理器、OEM shell 工具、SELinux、锁屏、Doze、进程 kill 与 Force Stop 逐项实测。
+supervisor 将应用 PID/starttime、自己的 PID/starttime、不可变 generation 和 watcher PID/命令行/状态纳入活动 lease 健康检查。活动期约 200 ms 检查轻量进程/文件状态，框架 user/profile 发现约每秒一次；应用进程另以 250 ms 周期调用 Root 新鲜核验。该核验只在 coordinator 互斥锁内读取当前 lease 身份，Root 命令本身在锁外执行，完成后再在锁内核对 lease 未被替换；因此监督不会延迟到来的 toggle。若核验期间 lease 已被新的 OPEN 事务替换，过期证明不作为对新 lease 的否定，下一周期会重新核验新 lease（新 lease 在其自身 OPEN 事务内已在锁内完成过一次证明）。任何无法确认都封闭 lease 并 BLOCK，而不是用同一 OPEN 授权静默拉起新 watcher。无活动 lease 时 supervisor 以 1 秒周期运行，且每轮都重新发现 user/profile；发现空闲期上下文变化时先对新全集执行全局 BLOCK/readback，再更新基线。这是实现证据，不是目标设备通过证据；必须对目标 Root 管理器、OEM shell 工具、SELinux、锁屏、Doze、进程 kill 与 Force Stop 逐项实测。
 
 持续监督能缩短已知故障暴露窗口，但不是形式化可用性证明：Root launcher/supervisor 自身仍可能被 Root 管理器、OOM/OEM、SELinux 或信号终止，shell `sleep` 和 sysfs wake lock 的目标内核语义也可能不同。应用仍存活时，250 ms 健康检查会将这类不确定性转为 BLOCK/ERROR；应用同时被 Force Stop 时，只剩独立 Root 层与已布防的 Android exact Alarm。所有 watcher/supervisor 死亡、Force Stop、熄屏和 Doze 场景仍为 `NOT_RUN`，不得因代码中存在 liveness 检查而标为通过。
 
@@ -288,6 +288,18 @@ supervisor 将应用 PID/starttime、自己的 PID/starttime、不可变 generat
 - 模块必须提供卸载、升级、失败恢复和手动 BLOCK 文档。
 
 watchdog 仍不能绕过某些 ROM 在锁屏时由 SensorPrivacyService 执行的认证策略；控制器本身仍须先通过 P0。
+
+### 12.4 toggle 热路径中的证明次数
+
+一次 BLOCKED→OPEN 的远程 toggle 在以下边界读取 Root：入口读回、租约布防（部署 watcher 并等待其取得 wake lock）、AppOps 前读、sensor privacy OPEN、跨门读回、AppOps 后读，以及互斥锁内 OPEN 读回之后的一次 PID 绑定 Root guard 证明。此前提交前还会在锁外重复同一证明，并因自身 `setMicrophoneMute` 触发的 `ACTION_MICROPHONE_MUTE_CHANGED` 再做一整轮复合读回；2026-09-05 起：
+
+- OPEN 提交只使用锁内的那一次 guard 证明。coordinator 互斥锁在证明与提交之间始终持有，lease 不可能被替换；周期性健康核验和之后的每次状态读取仍独立重新证明。
+- 提交前的过渡期漂移复核只重读 AudioManager，因为该广播只可能来自 AudioManager 门，而 Root 两门刚在互斥锁内新鲜读回。不一致仍拒绝成功响应并触发 fail-closed listener 拆除。
+- 声学校准身份（PackageManager + 签名摘要）在入口、控制器 OPEN 下发前与最终提交时各新鲜评估一次，其余中间检查复用最近一次结果。
+- `cancel()` 复用服务初始化时已声明的 Root 工作区所有权，不再为每次 BLOCK 额外执行一次所有权 Root 往返；撤销脚本本身仍在 Root flock 内核对所有者文件。
+- 每次 coordinator 操作消耗的 Root 往返次数记入审计记录的 `diagnostic`（`root_round_trips=N`）与状态快照，供真机对比。
+
+这些调整不改变 fail-closed 方向：任何被去掉的重复检查都在同一互斥锁内已有等价的新鲜证明。
 
 ## 13. 失败事件策略
 
@@ -311,6 +323,8 @@ watchdog 仍不能绕过某些 ROM 在锁屏时由 SensorPrivacyService 执行�
 - `root_sensor_privacy` 选项由 sensor privacy 主控、AudioManager OPEN gate 与同一只读 AppOps veto 组成。两个组合必须独立进行声学校准。
 - 两个发布选项对 AppOps 始终只读不写：UID override 与 package mode 合成后的有效 mode 为 `ignore`、`deny`、`errored` 即显式否决；查询/解析 UNKNOWN 也拒绝 OPEN。`foreground` 依赖 UID 实时进程态，因此只是条件性非显式否决，与 `allow`、`default` 一样只允许继续其他检查。它不能证明 ChatGPT 当前或锁屏/熄屏时可录音，必须由同一条 Live 会话的解锁、锁屏、熄屏声学校准补足证据。该 veto 在主控 OPEN 前后各读一次，后读出现显式否决或 UNKNOWN 则经所选控制器回滚 BLOCK。发布控制和 fail-safe 路径不得执行 `cmd appops set`。
 - 最终选择必须依据同一 ChatGPT Live 会话中解锁亮屏、锁屏亮屏、锁屏熄屏三种状态的 BLOCK 声学结果与 OPEN 后原会话恢复结果；单元测试、模拟器读回和命令退出码均不能替代。
+- UI 只在冷启动或从本 App 打开的系统设置页返回时发送 `ACTION_START`（先 BLOCK、撤销 listener 代次再重绑）；普通打开/回到前台只请求 `ACTION_REFRESH`。此前每次 onResume 都会重置信任边界，使“打开 App 查看状态”本身成为一次静音。
+- 应用内“测试切换”动作（`ACTION_TOGGLE`）与 iPhone 请求使用同一 `coordinator.execute` 路径、同一账本、同一校准门、同一租约布防与 listener 代次检查，仅审计来源为 `local-ui`；它不是绕过远程门的本地开关。
 - 可提交的校准必须在同一服务会话中完成 UI 的三个编号动作与最终提交，形成严格四段边界：带完整租约保护的临时 OPEN → Root-only split（`sensor_privacy=BLOCKED`、`AudioManager=OPEN`、AppOps 已读回为非显式否决 mode（只读且非 UNKNOWN）、Root guard 健康）→ 用户在 split 仍成立时确认无收音，应用新鲜复核后立即完整 BLOCK/清理租约 → 最终安全边界复核后提交。只有前后两个门独立读回为该 split，才能证明 Root fail-safe 不是 AudioManager 的镜像/别名。
 - 校准序列是内存严格状态机。新的临时 OPEN 尝试会先清空旧序列；失败、越序、split 改变、guard/租约失效、最终 BLOCK 或租约清理无法确认都会作废本轮。旧轮 OPEN/隔离/BLOCK 证据不得与新轮拼接，服务重建后也不得复用。
 - Root 扩大了信任边界：其他 Root 进程能读取 token、改变状态和伪造读回，因此“设备已被其他 Root 软件攻破”不在可防御范围内。
@@ -354,7 +368,7 @@ SQLite 最多保留 100 条，应用 UI 只展示最近 20 条；当前没有应
 | 慢连接耗尽服务 | 3 秒读取超时、大小限制、并发上限 4 | 无按来源/认证失败限速，同网攻击者仍可造成 DoS |
 | 外部改变麦克风状态 | 每次操作前后新鲜读回、UNKNOWN 策略 | 响应后仍可能立即被外部改变 |
 | OPEN 后 APK 崩溃 | RTC AlarmClock + 单调 exact Alarm；两个发布选项另加 Root watcher 与常驻 supervisor | supervisor/Root 工具/SELinux 的真实存活和调度仍须目标 Root 实测 |
-| Force Stop 后维持 OPEN | watcher + PID/starttime 绑定的 supervisor；活动时约 200 ms Root 监督及 250 ms 应用内健康检查 | 应用检查会随进程停止，独立 Root 层仍需真机证明；不能声称形式化保证 |
+| Force Stop 后维持 OPEN | watcher + PID/starttime 绑定的 supervisor；活动时约 200 ms Root 监督及 250 ms 应用内健康检查（Root 命令在 coordinator 锁外执行） | 应用检查会随进程停止，独立 Root 层仍需真机证明；不能声称形式化保证 |
 | Root Shell 返回 0 但未执行 | 独立 readback、锁屏 P0 | 无稳定读回的 ROM 不支持 |
 | 遗留 AppOps 被错误放宽 | 发布控制始终只读；旧选择迁移为 sensor privacy；全局 BLOCK 后保留当前值并只清元数据 | 升级路径与 OEM AppOps 输出仍须真机验证；不提供自动恢复原 mode |
 | 监听到错误接口 | 不绑定通配地址；同一 Wi‑Fi 来自 ConnectivityManager；API 36+ 热点来自 TetheringManager；网络变化先 BLOCK | 会绑定全部受监控的合格地址，平台分类仍需真机审计，IP 变化需重配 Shortcut |

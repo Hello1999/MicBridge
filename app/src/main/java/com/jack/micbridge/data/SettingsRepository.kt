@@ -295,6 +295,14 @@ class SettingsRepository(context: Context) {
         storedAcousticCalibrationIdentity() == current
     }
 
+    /** Null when the stored calibration authorizes the current environment. */
+    fun acousticCalibrationInvalidReason(): String? = synchronized(CALIBRATION_IDENTITY_LOCK) {
+        describeCalibrationMismatch(
+            stored = storedAcousticCalibrationIdentity(),
+            current = currentAcousticCalibrationIdentity(),
+        )
+    }
+
     fun calibratedAtEpochMs(): Long? =
         preferences.getLong(KEY_CALIBRATED_AT, 0L).takeIf { it > 0L }
 

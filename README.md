@@ -19,7 +19,10 @@ iPhone Action Button
 - Android Studio 工程、前台服务、Compose 设置/状态 UI、两个发布控制器、AppOps 只读 veto、HTTP API、持久幂等账本、审计日志和自动测试均在本仓库。
 - 默认包名是 `com.openai.chatgpt`，安装后必须用目标设备确认实际包名。
 - UI 的选择顺序服从项目要求：发布版默认先测 `audio_manager`；失败后才由用户手动选择 `root_sensor_privacy`，运行时绝不自动换控制器。发布版没有可选的 `root_appops` 写入控制器。注意这些选项 ID 不等于单一门控：默认选项实际由 AudioManager 主控、Root `sensor_privacy` gate 和 ChatGPT `RECORD_AUDIO` AppOps 只读 veto 组成。
-- 当前源码执行 `./gradlew testDebugUnitTest lintDebug assembleDebug` 已通过：JVM 172/172，0 failure、0 error、0 skipped；Lint 成功。最终 Debug APK 为 30,704,855 bytes，SHA-256 `403072a677facd8ef730a647b77bed255f0cde17944457b601d86911bd82ca65`，使用 Android Debug 签名，仅用于目标设备验收。
+- 2026-09-05 的 UI/热路径调整（已于 2026-09-05 重新打包并部署到 Motorola XT2153-1）：设置页重构为“状态 → 操作 → 就绪检查 → iPhone 配置 → 声学校准向导 → 高级设置 → 诊断”，状态区直接说明快捷指令当前能否成功以及失败原因（含校准失效的具体原因，例如“ChatGPT 已更新”）；打开或回到 App 不再发送 `ACTION_START`（此前会先 BLOCK 再重建 HTTP 监听），只有冷启动或从本 App 打开的系统设置页返回时才重扫；新增走完全相同远程路径的应用内“测试切换”按钮（审计来源 `local-ui`）；隔离校准状态改由显式快照字段驱动。热路径：OPEN 提交只使用互斥锁内的一次 Root guard 证明；校准身份在入口、下发前与提交时各评估一次；提交前的漂移复核只重读 AudioManager；250 ms 应用内 Root 健康证明改在 coordinator 锁外执行；`cancel()` 复用进程内已声明的工作区所有权；过渡态通知更新以 150 ms 合并；审计记录附带每次操作的 Root 往返次数。当前源码 `./gradlew testDebugUnitTest lintDebug assembleDebug`：JVM 188 个测试，0 failure、0 error、2 skipped（`RootShellSessionTest` 在无 `sh` 的 Windows 主机上按 assume 跳过）。本轮已重新打包并部署，产物与设备证据见下条；调整前的 APK 哈希与 Motorola 真机证据已作废，所有真机项目必须按新构建重跑。
+- 2026-09-05 重新打包与部署：`./gradlew testDebugUnitTest lintDebug assembleDebug` 通过（JVM 188 个测试，0 failure、0 error、2 skipped）。新 Debug APK 为 30,627,266 bytes，SHA-256 `ccbeb01aed904457ddbeb5c123547fd427379d9fb09cc76f274c8cd793514dbb`。设备上原有的 30,704,855-byte 版本由**另一台电脑的 Android Debug key**（证书 SHA-256 `ed5a04b7…`）签名，本机 key 为 `08e3c98e…`，`adb install -r` 返回 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，因此只能卸载后全新安装。卸载前后 `mic mute FromApi=true` 且全部 8 个 `sensor_privacy` toggle 均为 BLOCKED；卸载后另行终止了残留的 boot supervisor/failsafe 进程并删除 `/data/adb/service.d/micbridge-failsafe.sh` 与 `/data/adb/micbridge`。全新安装后设备 `base.apk` 的 SHA-256 与本地产物一致，前台服务启动、`8787` 按 fail-closed 设计未监听（令牌、通知权限、开机保护与校准均已随卸载清空，须在 App 内重建）。
+- **作废**：卸载同时删除了应用数据与 Root 开机保护，因此下列两条调整前的构建与 Motorola 证据（含两次重启的 boot guard 检查、OEM op525 自启动许可、`/healthz` 结果）不再代表设备当前状态，仅作历史记录。
+- 调整前源码执行 `./gradlew testDebugUnitTest lintDebug assembleDebug` 已通过：JVM 172/172，0 failure、0 error、0 skipped；Lint 成功。最终 Debug APK 为 30,704,855 bytes，SHA-256 `403072a677facd8ef730a647b77bed255f0cde17944457b601d86911bd82ca65`，使用 Android Debug 签名，仅用于目标设备验收。
 - 最终 APK 已部署到 Motorola XT2153-1（Android 13 / API 33），设备 `base.apk` 的 SHA-256 与本地产物完全一致。Root boot guard 已通过两次真实重启检查；最终一次 `boot_count` 由 230 变为 231，所有已发现 user/profile 的麦克风隐私状态均为 BLOCKED，Motorola OEM 自启动许可持久化后由 `BootReceiver` 自然启动前台服务，端口 `8787` 监听且 `/healthz` 返回 `{"ok":true}`，未发现相关崩溃或 AVC。iPhone 快捷指令的单次 POST、响应校验和 1/2/3 次分支静态结构已验证并通过 iCloud 同步。
 - 当前源码已在本机新建的 API 36.1 / Android 16 AVD 上完成 13/13 仪器测试；清除应用数据后冷启动时前台服务正常运行，AVD 无 `su`，端口 `8787` 按 fail-closed 设计保持关闭。API 37 模拟器的 13/13、安装及无 Root fail-closed 结果仍来自较早源码快照，尚未对当前源码重跑。ChatGPT Voice/Live 声学校准、Android 物理锁屏/熄屏与 Doze、iPhone Action Button 实际运行、1/2/3 次触感以及故障注入仍为 `NOT_RUN`。详见 [测试矩阵](docs/DEVICE_TEST_MATRIX.md) 与 [真机测试计划](docs/REAL_DEVICE_TEST_PLAN_ZH.md)。
 
@@ -35,7 +38,7 @@ iPhone Action Button
 
 最终选择只依据同一条 ChatGPT Live 会话上的声学校准结果：分别在 Android 解锁亮屏、锁屏亮屏、锁屏熄屏时确认 BLOCK 后听不到测试语句，并确认 OPEN 后无需退出或重建该会话即可恢复收音。两个发布候选在目标 Root Android 上完成这些步骤前，都不能宣称合格。
 
-每轮可提交的校准还必须在**同一次服务会话**中完成 UI 的三个编号动作与最终提交（即四段安全边界）：① 建立已读回确认、双 Alarm 和 Root watcher 均已布防的临时 OPEN；② 进入 Root-only 隔离状态，新鲜确认 `sensor_privacy=BLOCKED` 、`AudioManager=OPEN`、AppOps 已读回为非显式否决 mode（只读且非 UNKNOWN）且 Root guard 健康；③ 用户必须在该 split 状态尚存在时确认 ChatGPT 无收音，应用重新读回上述条件后立即执行完整 BLOCK 并清理租约；④ 仅在最终 BLOCKED/租约清理仍可确认时点击“记录校准通过”提交。任一步失败、越序、重新开始或状态变化都会将本轮证据清零；新一轮绝不复用旧轮的 OPEN/隔离/BLOCK 证据。
+每轮可提交的校准还必须在**同一次服务会话**中完成 UI 的三个编号动作与最终提交（即四段安全边界）。UI 以向导形式只高亮当前步骤，当前步骤由已发布的快照（含显式的隔离标志 `calibrationIsolationActive`）推导，而不再匹配错误文案；服务仍对每一步独立复核：① 建立已读回确认、双 Alarm 和 Root watcher 均已布防的临时 OPEN；② 进入 Root-only 隔离状态，新鲜确认 `sensor_privacy=BLOCKED` 、`AudioManager=OPEN`、AppOps 已读回为非显式否决 mode（只读且非 UNKNOWN）且 Root guard 健康；③ 用户必须在该 split 状态尚存在时确认 ChatGPT 无收音，应用重新读回上述条件后立即执行完整 BLOCK 并清理租约；④ 仅在最终 BLOCKED/租约清理仍可确认时点击“记录校准通过”提交。任一步失败、越序、重新开始或状态变化都会将本轮证据清零；新一轮绝不复用旧轮的 OPEN/隔离/BLOCK 证据。
 
 ## 已裁决的实现取舍
 
@@ -116,7 +119,7 @@ app/build/outputs/apk/debug/app-debug.apk
    adb install -r .\app\build\outputs\apk\debug\app-debug.apk
    ```
 
-3. 打开 MicBridge，授予通知权限。Android 17 还必须授予“本地网络”权限；拒绝时应用保持屏蔽且不监听端口。
+3. 打开 MicBridge，授予通知权限。首页“就绪检查”会逐项列出 Root、通知、电池优化豁免、精确闹钟、本地网络权限、可靠模式、前台用户、监听地址、Root 开机保护与声学校准，任一项未通过都会在状态区说明快捷指令将失败。Android 17 还必须授予“本地网络”权限；拒绝时应用保持屏蔽且不监听端口。
 4. 保持默认 `audio_manager` 组合选项并启动服务，在 Root 管理器中向 MicBridge 授权 Root；默认组合确认 OPEN 需要读取 Root `sensor_privacy` 状态。服务运行时不能更换控制器或包名。
 5. 先在同一 ChatGPT Live 会话中完成 AudioManager 的解锁、锁屏、熄屏 P0 测试，并按 UI 的三个编号动作加最终提交完成“临时 OPEN → Root-only 隔离 → 在 split 状态确认无收音并立即完整 BLOCK → 提交”。只有失败后才停止服务，手动改选 Root `sensor_privacy` 并从第一个动作重新测试；这两种候选需要分别校准，不能运行时静默切换或复用旧证据。
 6. 对两个发布选项分别安装/刷新 Root 开机保护，并核对 `boot-status`、所选控制器读回、supervisor 的 PID/starttime 身份，以及每次 OPEN 的 watcher 是否成功取得有超时的 `/sys/power/wake_lock`。默认 `audio_manager` 的开机/租约 Root 保护以全局 sensor privacy 为 BLOCK 目标。任一条件不满足都应拒绝 OPEN，且必须真机重启/熄屏测试后才能记为通过。AppOps 在两个组合中均只读 veto。
@@ -125,7 +128,7 @@ app/build/outputs/apk/debug/app-debug.apk
 9. 选择网络拓扑时先看 Android API 级别。API 31–35 只支持 Android 与 iPhone 连接同一个可信 Wi‑Fi，不接受 Android 自建热点；API 36+ 可优先用 Android 私人热点，但只有 `TetheringManager` 回调成功注册并明确报告下游接口名时才会绑定热点 IPv4。两种路径都不监听 `0.0.0.0`；无法完整监控时保持 BLOCKED 且不监听。逐一核对 UI 列出的地址，并在系统/热点更新后重测身份变化和熄屏行为。
 10. 从 UI 复制 Toggle URL 与令牌，按 [iPhone 快捷指令教程](docs/IPHONE_SHORTCUT_ZH.md) 配置 Action Button。
 
-服务运行时，令牌、端口、控制器和目标包的危险变更会被 UI 禁用或要求先“屏蔽后停止”。
+服务运行时，令牌、端口、控制器和目标包的危险变更会被 UI 禁用或要求先“静音后停止服务”。打开或回到 MicBridge 页面只请求一次状态刷新，不会改变麦克风状态；从本 App 打开的系统设置页返回后会执行一次先 BLOCK 再重扫的信任边界重置。首页“测试”按钮与 iPhone 请求走同一条受保护路径，可在没有 iPhone 时验证一轮 BLOCKED→OPEN→BLOCKED。
 
 ## HTTP API
 
@@ -197,7 +200,7 @@ iPhone 的产品流程只使用 `/v1/mic/toggle`；`open`、`block` 与 `status`
 
 - `./gradlew testDebugUnitTest lintDebug assembleDebug`：`PASS`；JVM 172/172，0 failure、0 error、0 skipped。
 - Android Lint：0 errors、28 warnings、1 hint；warnings 为 21 `UseKtx`、3 `NewerVersionAvailable`、2 `ApplySharedPref`、1 `AndroidGradlePluginVersion`、1 `GradleDependency`，hint 为 1 `AutoboxingStateCreation`。
-- APK：`app/build/outputs/apk/debug/app-debug.apk`，30,704,855 bytes，SHA-256 `403072a677facd8ef730a647b77bed255f0cde17944457b601d86911bd82ca65`。设备 `base.apk` 的 SHA-256 已核对一致。
+- APK（历史，调整前构建）：`app/build/outputs/apk/debug/app-debug.apk`，30,704,855 bytes，SHA-256 `403072a677facd8ef730a647b77bed255f0cde17944457b601d86911bd82ca65`。当前产物已由 2026-09-05 重新打包取代：30,627,266 bytes，SHA-256 `ccbeb01aed904457ddbeb5c123547fd427379d9fb09cc76f274c8cd793514dbb`，设备 `base.apk` 的 SHA-256 已核对一致。
 - 当前源码在 API 36.1 / Android 16、Google Play ARM64 AVD 上安装成功，仪器测试 13/13 `PASS`；清除数据后冷启动的 `connectedDevice` 前台服务正常运行，AVD 无 `su`，`8787` 未监听，验证缺少 Root/控制读回时保持 fail-closed。
 - 较早源码快照曾在 API 37 / Android 17 Pixel_10_Pro AVD 完成 13/13 仪器测试、安装、冷启动和无 Root 时 fail-closed 检查；该 AVD 结果未对当前最终源码重跑，因此只保留为历史范围证据，不能归到上述最终 APK。
 - 最终 APK 已安装到 Motorola XT2153-1（Android 13 / API 33）。Root boot guard 两次真实重启检查均保持 BLOCKED；最终验收中 `boot_count` 230 → 231，generation/status、launcher/supervisor 与 fd 0 locks 正常，users 0/10/11/900–904 全部 BLOCKED。Motorola OEM op525 仅允许 user 0 的 MicBridge UID 10432 且已写盘，重启后 `BootReceiver` 自然启动 FGS PID 4701，`8787` 正常监听，`GET /healthz` 返回 `{"ok":true}`，未发现相关崩溃或 AVC。

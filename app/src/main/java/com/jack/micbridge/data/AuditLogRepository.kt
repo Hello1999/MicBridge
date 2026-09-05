@@ -48,7 +48,7 @@ class AuditLogRepository(
     }
 
     @Synchronized
-    fun append(source: String, result: OperationResult) {
+    fun append(source: String, result: OperationResult, diagnostic: String? = null) {
         val values = ContentValues().apply {
             put("epoch_ms", System.currentTimeMillis())
             put("source", source.take(64))
@@ -61,7 +61,7 @@ class AuditLogRepository(
             put("controller", result.controllerId.take(64))
             put("latency_ms", result.latencyMs)
             put("error_code", result.errorCode?.take(64))
-            putNull("diagnostic")
+            if (diagnostic == null) putNull("diagnostic") else put("diagnostic", diagnostic.take(240))
         }
         writableDatabase.insert("audit", null, values)
         writableDatabase.execSQL(

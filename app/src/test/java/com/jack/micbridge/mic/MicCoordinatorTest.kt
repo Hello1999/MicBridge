@@ -883,6 +883,169 @@ class MicCoordinatorTest {
         assertEquals(false, entry.ok)
     }
 
+    @Test
+    fun `isolation split state is published as an explicit snapshot flag`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            calibrated = false,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = true
+        fixture.coordinator.calibrationOpen()
+        assertFalse(fixture.snapshots.last().calibrationIsolationActive)
+        val rootGate = FakeController(MicAccessState.OPEN, "root_sensor_privacy")
+        val audioGate = FakeController(MicAccessState.OPEN, "audio_manager")
+
+        fixture.coordinator.calibrationIsolateRootFailsafe(
+            rootGate,
+            audioGate,
+            ReadOnlyOpenVeto { MicAccessState.OPEN },
+        )
+        assertTrue(fixture.snapshots.last().calibrationIsolationActive)
+
+        fixture.coordinator.confirmRootIsolationAndBlock(
+            rootGate,
+            audioGate,
+            ReadOnlyOpenVeto { MicAccessState.OPEN },
+        )
+        assertFalse(fixture.snapshots.last().calibrationIsolationActive)
+        assertFalse(
+            fixture.snapshots.any {
+                it.calibrationIsolationActive && it.micAccess != MicAccessState.UNKNOWN
+            },
+        )
+    }
+
+    @Test
+    fun `failed isolation clears the split state flag`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            calibrated = false,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = true
+        fixture.coordinator.calibrationOpen()
+        val rootGate = FakeController(MicAccessState.OPEN, "root_sensor_privacy")
+        val audioGate = FakeController(MicAccessState.OPEN, "audio_manager")
+        fixture.coordinator.calibrationIsolateRootFailsafe(
+            rootGate,
+            audioGate,
+            ReadOnlyOpenVeto { MicAccessState.OPEN },
+        )
+        assertTrue(fixture.snapshots.last().calibrationIsolationActive)
+
+        fixture.coordinator.localBlock("test-abort")
+
+        assertFalse(fixture.snapshots.last().calibrationIsolationActive)
+    }
+
+    @Test
+    fun `guarded open proves the Root guard exactly once inside the mutation lock`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = true
+
+        val opened = fixture.coordinator.execute(
+            MicCoordinator.ENDPOINT_TOGGLE,
+            "request-guard-once-01",
+        )
+
+        assertTrue(opened.ok)
+        assertEquals(1, fixture.lease.guardVerificationCount)
+    }
+
+    @Test
+    fun `guard lost during open still rolls back inside the lock`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = true
+        fixture.controller.onOpen = { fixture.lease.guardHealthy = false }
+
+        val result = fixture.coordinator.execute(
+            MicCoordinator.ENDPOINT_TOGGLE,
+            "request-guard-lost-01",
+        )
+
+        assertFalse(result.ok)
+        assertEquals("LEASE_GUARD_UNHEALTHY", result.errorCode)
+        assertEquals(MicAccessState.BLOCKED, fixture.controller.state)
+    }
+
+    @Test
+    fun `health check reports lost guard and needs no proof while blocked`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = true
+        fixture.coordinator.initialize()
+        assertTrue(fixture.coordinator.activeRootGuardHealthy())
+        assertEquals(0, fixture.lease.guardVerificationCount)
+
+        assertTrue(
+            fixture.coordinator.execute(MicCoordinator.ENDPOINT_TOGGLE, "request-health-01").ok,
+        )
+        val proofsAfterOpen = fixture.lease.guardVerificationCount
+        assertTrue(fixture.coordinator.activeRootGuardHealthy())
+        assertEquals(proofsAfterOpen + 1, fixture.lease.guardVerificationCount)
+
+        fixture.lease.guardHealthy = false
+        assertFalse(fixture.coordinator.activeRootGuardHealthy())
+    }
+
+    @Test
+    fun `health check does not hold the coordinator mutex during the Root proof`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = true
+        assertTrue(
+            fixture.coordinator.execute(
+                MicCoordinator.ENDPOINT_TOGGLE,
+                "request-health-lock-01",
+            ).ok,
+        )
+        val proofStarted = CompletableDeferred<Unit>()
+        val releaseProof = CompletableDeferred<Unit>()
+        fixture.lease.onVerify = {
+            if (!proofStarted.isCompleted) {
+                proofStarted.complete(Unit)
+                releaseProof.await()
+            }
+        }
+
+        val health = async { fixture.coordinator.activeRootGuardHealthy() }
+        proofStarted.await()
+        // A toggle must be able to enter the coordinator while the Root proof is in flight.
+        val blocked = fixture.coordinator.execute(
+            MicCoordinator.ENDPOINT_TOGGLE,
+            "request-health-lock-02",
+        )
+        assertEquals(MicAccessState.BLOCKED, blocked.micAccess)
+        releaseProof.complete(Unit)
+
+        // The lease the proof was about no longer exists, so the stale proof is not evidence.
+        assertTrue(health.await())
+    }
+
+    @Test
+    fun `execute records the caller supplied audit source`() = runTest {
+        val fixture = Fixture(initialState = MicAccessState.BLOCKED)
+
+        fixture.coordinator.execute(
+            MicCoordinator.ENDPOINT_TOGGLE,
+            "local-ui-0123456789abcdef",
+            auditSource = "local-ui",
+        )
+
+        assertEquals("local-ui", fixture.operations.last().first)
+    }
+
     private class Fixture(
         initialState: MicAccessState,
         calibrated: Boolean = true,
@@ -899,6 +1062,7 @@ class MicCoordinatorTest {
         val ledger = MemoryLedger()
         val lease = FakeLease { time }
         val snapshots = mutableListOf<BridgeSnapshot>()
+        val operations = mutableListOf<Pair<String, com.jack.micbridge.data.OperationResult>>()
         val coordinator = MicCoordinator(
             controller = controller,
             ledger = ledger,
@@ -916,6 +1080,7 @@ class MicCoordinatorTest {
                 if (failSnapshotWhen(snapshot)) error("snapshot failure")
                 snapshots += snapshot
             },
+            onOperation = { source, result -> operations += source to result },
         )
     }
 
@@ -978,6 +1143,7 @@ class MicCoordinatorTest {
         var rootWatchdogArmed = false
         var guardHealthy = true
         var guardVerificationCount = 0
+        var onVerify: suspend () -> Unit = {}
         var cancelCount = 0
         var activeLease: ActiveSafetyLease? = null
         var onArm: () -> Unit = {}
@@ -1050,6 +1216,7 @@ class MicCoordinatorTest {
 
         override suspend fun verifyActiveGuard(requestId: String): Boolean {
             guardVerificationCount++
+            onVerify()
             return guardHealthy && activeLease?.requestId == requestId
         }
 
