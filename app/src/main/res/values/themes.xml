@@ -2,8 +2,9 @@
     <style name="Theme.MicBridge" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:windowLightStatusBar">true</item>
-        <item name="android:statusBarColor">#F6F7F9</item>
-        <item name="android:navigationBarColor">#F6F7F9</item>
+        <item name="android:windowBackground">#F5F7FA</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightNavigationBar">true</item>
     </style>
 </resources>
-

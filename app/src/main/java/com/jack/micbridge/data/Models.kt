@@ -6,6 +6,14 @@ enum class MicAccessState(val wireValue: String) {
     UNKNOWN("unknown")
 }
 
+/** Read-only progress for the UI; never an authorization to open the microphone. */
+enum class CalibrationStage { IDLE, OPEN, ISOLATED, BLOCKED }
+
+data class CalibrationProgress(
+    val stage: CalibrationStage = CalibrationStage.IDLE,
+    val working: Boolean = false,
+)
+
 data class ProbeResult(
     val available: Boolean,
     val stateReadable: Boolean,

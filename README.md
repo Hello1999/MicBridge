@@ -14,12 +14,16 @@ iPhone Action Button
   → 成功切换后由 Android 播放 30% 媒体音量的上扬/下行电子提示音
 ```
 
-## 当前交付状态
+## 界面更新（2026-09-12）
+
+界面现分为“控制 / 连接 / 设置”，提供独立的校准引导、诊断及高级控制页面，并支持深色主题、窄屏和大字体。详情与本次验证见 [UI 改版说明](docs/UI_REDESIGN_ZH.md)。本次 Debug 构建通过 246 项 JVM 测试、13 项 API 36.1 仪器测试及 Lint；尚未部署真机。更新 UI 会按既有构建身份规则使旧声学校准失效，需要重新校准。
+
+## 控制实现与历史验证记录
 
 - Android Studio 工程、前台服务、Compose 设置/状态 UI、两个发布控制器、AppOps 只读 veto、HTTP API、持久幂等账本、审计日志和自动测试均在本仓库。
 - 默认包名是 `com.openai.chatgpt`，安装后必须用目标设备确认实际包名。
 - UI 的选择顺序服从项目要求：发布版默认先测 `audio_manager`；失败后才由用户手动选择 `root_sensor_privacy`，运行时绝不自动换控制器。发布版没有可选的 `root_appops` 写入控制器。注意这些选项 ID 不等于单一门控：默认选项实际由 AudioManager 主控、Root `sensor_privacy` gate 和 ChatGPT `RECORD_AUDIO` AppOps 只读 veto 组成。
-- 当前源码执行 `./gradlew testDebugUnitTest lintDebug assembleDebug` 已通过：JVM 172/172，0 failure、0 error、0 skipped；Lint 成功。最终 Debug APK 为 30,704,855 bytes，SHA-256 `403072a677facd8ef730a647b77bed255f0cde17944457b601d86911bd82ca65`，使用 Android Debug 签名，仅用于目标设备验收。
+- 此前控制实现构建执行 `./gradlew testDebugUnitTest lintDebug assembleDebug` 已通过：JVM 172/172，0 failure、0 error、0 skipped；Lint 成功。该历史 Debug APK 为 30,704,855 bytes，SHA-256 `403072a677facd8ef730a647b77bed255f0cde17944457b601d86911bd82ca65`，使用 Android Debug 签名，仅用于目标设备验收。以下真机记录属于该历史构建，不代表本次 UI 改版的真机验收。
 - 最终 APK 已部署到 Motorola XT2153-1（Android 13 / API 33），设备 `base.apk` 的 SHA-256 与本地产物完全一致。Root boot guard 已通过两次真实重启检查；最终一次 `boot_count` 由 230 变为 231，所有已发现 user/profile 的麦克风隐私状态均为 BLOCKED，Motorola OEM 自启动许可持久化后由 `BootReceiver` 自然启动前台服务，端口 `8787` 监听且 `/healthz` 返回 `{"ok":true}`，未发现相关崩溃或 AVC。iPhone 快捷指令的单次 POST、响应校验和 1/2/3 次分支静态结构已验证并通过 iCloud 同步。
 - 当前源码已在本机新建的 API 36.1 / Android 16 AVD 上完成 13/13 仪器测试；清除应用数据后冷启动时前台服务正常运行，AVD 无 `su`，端口 `8787` 按 fail-closed 设计保持关闭。API 37 模拟器的 13/13、安装及无 Root fail-closed 结果仍来自较早源码快照，尚未对当前源码重跑。ChatGPT Voice/Live 声学校准、Android 物理锁屏/熄屏与 Doze、iPhone Action Button 实际运行、1/2/3 次触感以及故障注入仍为 `NOT_RUN`。详见 [测试矩阵](docs/DEVICE_TEST_MATRIX.md) 与 [真机测试计划](docs/REAL_DEVICE_TEST_PLAN_ZH.md)。
 
@@ -193,7 +197,7 @@ iPhone 的产品流程只使用 `/v1/mic/toggle`；`open`、`block` 与 `status`
 - 状态提示音只在读回确认的真实 `BLOCKED ↔ OPEN` 切换后选择；失败、幂等重放、状态断言和 `UNKNOWN` 收敛不播放。
 - Android 仪器测试检查生产 Manifest 不含 `RECORD_AUDIO`、紧急接收器不导出、前台服务类型与 Direct Boot 最小配置。
 
-最终源码构建证据（APK 产物时间 `2026-09-04T03:18:22Z`）：
+历史源码构建证据（APK 产物时间 `2026-09-04T03:18:22Z`）：
 
 - `./gradlew testDebugUnitTest lintDebug assembleDebug`：`PASS`；JVM 172/172，0 failure、0 error、0 skipped。
 - Android Lint：0 errors、28 warnings、1 hint；warnings 为 21 `UseKtx`、3 `NewerVersionAvailable`、2 `ApplySharedPref`、1 `AndroidGradlePluginVersion`、1 `GradleDependency`，hint 为 1 `AutoboxingStateCreation`。

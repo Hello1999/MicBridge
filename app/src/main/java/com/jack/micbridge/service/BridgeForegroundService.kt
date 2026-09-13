@@ -120,7 +120,7 @@ class BridgeForegroundService : Service() {
     private var lastObservedLanAddresses: Set<String> = emptySet()
     private var scheduledDeadline: Long? = null
     private var wakeLock: PowerManager.WakeLock? = null
-    private val calibrationSession = CalibrationSession()
+    private val calibrationSession = CalibrationSession(ServiceRuntime::publishCalibrationStage)
     @Volatile
     private var initialized = false
     @Volatile
@@ -235,6 +235,7 @@ class BridgeForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        ServiceRuntime.resetCalibrationProgress()
         shuttingDown = false
         maintenanceBoundaryActive = false
         calibrationBoundaryActive = false
@@ -311,6 +312,7 @@ class BridgeForegroundService : Service() {
             if (calibrationOperation) {
                 if (action == ACTION_CALIBRATION_OPEN) calibrationBoundaryGeneration += 1L
                 calibrationOperationsInFlight += 1
+                ServiceRuntime.publishCalibrationWorking(true)
                 calibrationBoundaryActive = true
             }
             calibrationBoundaryGeneration
@@ -649,6 +651,7 @@ class BridgeForegroundService : Service() {
                         synchronized(calibrationBoundaryLock) {
                             calibrationOperationsInFlight =
                                 (calibrationOperationsInFlight - 1).coerceAtLeast(0)
+                            ServiceRuntime.publishCalibrationWorking(calibrationOperationsInFlight > 0)
                         }
                     }
                 }

@@ -1,12 +1,18 @@
 package com.jack.micbridge.service
 
 import com.jack.micbridge.data.AcousticCalibrationIdentity
+import com.jack.micbridge.data.CalibrationStage
 import com.jack.micbridge.data.MicAccessState
 import com.jack.micbridge.data.OperationResult
 
 /** In-memory proof that one immutable environment exercised the full calibration sequence. */
-internal class CalibrationSession {
+internal class CalibrationSession(private val onStageChanged: (CalibrationStage) -> Unit = {}) {
     private var state = State.IDLE
+        set(value) {
+            field = value
+            // Display publication must never change the outcome of a safety operation.
+            runCatching { onStageChanged(CalibrationStage.valueOf(value.name)) }
+        }
     private var frozenIdentity: AcousticCalibrationIdentity? = null
 
     /**

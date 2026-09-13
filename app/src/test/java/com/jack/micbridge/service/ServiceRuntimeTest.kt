@@ -1,6 +1,8 @@
 package com.jack.micbridge.service
 
 import com.jack.micbridge.data.BridgeSnapshot
+import com.jack.micbridge.data.CalibrationProgress
+import com.jack.micbridge.data.CalibrationStage
 import com.jack.micbridge.data.MicAccessState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -24,6 +26,8 @@ class ServiceRuntimeTest {
             ),
         )
 
+        ServiceRuntime.publishCalibrationStage(CalibrationStage.ISOLATED)
+        ServiceRuntime.publishCalibrationWorking(true)
         ServiceRuntime.markStopped()
 
         val stopped = ServiceRuntime.snapshot.value
@@ -35,5 +39,6 @@ class ServiceRuntimeTest {
         assertNull(stopped.leaseExactAlarmArmed)
         assertNull(stopped.leaseRootWatchdogArmed)
         assertNull(stopped.lastError)
+        assertEquals(CalibrationProgress(), ServiceRuntime.calibration.value)
     }
 }

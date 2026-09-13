@@ -1,6 +1,7 @@
 package com.jack.micbridge.service
 
 import com.jack.micbridge.data.AcousticCalibrationIdentity
+import com.jack.micbridge.data.CalibrationStage
 import com.jack.micbridge.data.MicAccessState
 import com.jack.micbridge.data.OperationResult
 import org.junit.Assert.assertFalse
@@ -8,6 +9,26 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CalibrationSessionTest {
+    @Test
+    fun `display observer failure cannot interrupt the verified calibration sequence`() {
+        val session = CalibrationSession { error("unavailable display observer") }
+        completeRound(session, identity())
+        assertTrue(session.identityForCommit(identity(), finalBoundarySafe = true) == identity())
+    }
+
+    @Test
+    fun `UI observes only verified stages and failed rounds return to idle`() {
+        val observed = mutableListOf<CalibrationStage>()
+        val session = CalibrationSession(observed::add)
+        session.beginOpenAttempt(identity())
+        session.observeOpen(identity(), openResult().copy(controlReadback = false))
+        assertTrue(observed.all { it == CalibrationStage.IDLE })
+        completeRound(session, identity())
+        assertTrue(observed.takeLast(3) == listOf(CalibrationStage.OPEN, CalibrationStage.ISOLATED, CalibrationStage.BLOCKED))
+        session.reset()
+        assertTrue(observed.last() == CalibrationStage.IDLE)
+    }
+
     @Test
     fun `commit requires guarded open root isolation then verified blocked in same session`() {
         val session = CalibrationSession()
