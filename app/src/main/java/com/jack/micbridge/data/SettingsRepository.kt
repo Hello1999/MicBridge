@@ -1,20 +1,15 @@
 package com.jack.micbridge.data
 
-import android.Manifest
 import android.content.Context
 import android.content.SharedPreferences
-import android.content.pm.PackageInfo
-import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import com.jack.micbridge.BuildConfig
 import com.jack.micbridge.server.AuthGuard
-import java.security.MessageDigest
 
 class SettingsRepository(context: Context) {
     private val preferences: SharedPreferences =
         context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-    private val packageManager = context.packageManager
     private val directBootSettings = DirectBootSettings(context)
 
     /**
@@ -81,29 +76,13 @@ class SettingsRepository(context: Context) {
             }
         }
 
+    /** Legacy experimental AppOps metadata only; never selects the system control target. */
     var targetPackage: String
         get() = preferences.getString(KEY_TARGET_PACKAGE, DEFAULT_CHATGPT_PACKAGE)
             ?: DEFAULT_CHATGPT_PACKAGE
         set(value) {
-            synchronized(CALIBRATION_IDENTITY_LOCK) {
-                if (value != targetPackage) {
-                    check(!hasPendingAppOpsState) {
-                        "存在尚未安全恢复的 AppOps 状态；禁止更换目标包"
-                    }
-                }
-                val changed = value != targetPackage
-                val editor = preferences.edit().putString(KEY_TARGET_PACKAGE, value)
-                if (changed) {
-                    editor.putLong(
-                        KEY_CALIBRATION_SETTINGS_GENERATION,
-                        Math.addExact(calibrationSettingsGeneration, 1L),
-                    )
-                }
-                check(editor.commit()) {
-                    "目标包设置持久化失败"
-                }
-                invalidateCalibrationIdentityCache()
-                check(mirrorDirectBootController()) { "Direct Boot 目标镜像失败" }
+            check(preferences.edit().putString(KEY_TARGET_PACKAGE, value).commit()) {
+                "旧目标包元数据持久化失败"
             }
         }
 
@@ -184,14 +163,9 @@ class SettingsRepository(context: Context) {
         .commit()
         .also { invalidateCalibrationIdentityCache() }
 
-    /**
-     * AppOps must never become the pre-unlock blocker until its exact restorable package mode
-     * has been durably captured. Until then AudioManager remains the conservative boot target.
-     */
-    fun mirrorDirectBootController(): Boolean {
-        val selected = controllerId
-        return directBootSettings.mirror(selected, targetPackage)
-    }
+    /** Before unlock, release controllers always address the system microphone. */
+    fun mirrorDirectBootController(): Boolean =
+        directBootSettings.mirror(controllerId, GLOBAL_MIC_TARGET)
 
     var port: Int
         get() = preferences.getInt(KEY_PORT, DEFAULT_PORT)
@@ -253,15 +227,13 @@ class SettingsRepository(context: Context) {
     /**
      * Persists only the identity frozen at the start of the completed calibration round.
      * A fresh capture must still match, but that fresh capture is never substituted for the
-     * tested value. Therefore a concurrent package/system/configuration change either rejects
+     * tested value. Therefore a concurrent system/configuration change either rejects
      * the commit or immediately makes the saved proof invalid.
      */
     fun markAcousticCalibrationPassed(
         testedIdentity: AcousticCalibrationIdentity,
     ): Boolean = synchronized(CALIBRATION_IDENTITY_LOCK) {
-        // A calibration commit is rare and must compare against a capture taken now, never
-        // against the memo: the 250 ms window is acceptable on the toggle path but not for
-        // the one decision that creates a durable proof.
+        // Persist only a fresh system identity that matches the completed round.
         invalidateCalibrationIdentityCache()
         if (currentAcousticCalibrationIdentity() != testedIdentity) return@synchronized false
         preferences.edit()
@@ -271,20 +243,12 @@ class SettingsRepository(context: Context) {
             )
             .putString(KEY_CALIBRATED_FINGERPRINT, testedIdentity.androidFingerprint)
             .putString(KEY_CALIBRATED_ANDROID_BUILD_ID, testedIdentity.androidBuildId)
-            .putString(KEY_CALIBRATED_PACKAGE, testedIdentity.targetPackage)
-            .putString(
-                KEY_CALIBRATED_PACKAGE_VERSION,
-                testedIdentity.targetPackageVersion,
-            )
-            .putInt(KEY_CALIBRATED_PACKAGE_UID, testedIdentity.targetPackageUid)
-            .putLong(
-                KEY_CALIBRATED_PACKAGE_LAST_UPDATE_TIME,
-                testedIdentity.targetPackageLastUpdateTimeEpochMs,
-            )
-            .putString(
-                KEY_CALIBRATED_PACKAGE_SIGNING_CERT_SHA256,
-                testedIdentity.targetSigningCertificateSha256,
-            )
+            .putString(KEY_CALIBRATED_SCOPE, SYSTEM_CALIBRATION_SCOPE)
+            .remove(KEY_CALIBRATED_PACKAGE)
+            .remove(KEY_CALIBRATED_PACKAGE_VERSION)
+            .remove(KEY_CALIBRATED_PACKAGE_UID)
+            .remove(KEY_CALIBRATED_PACKAGE_LAST_UPDATE_TIME)
+            .remove(KEY_CALIBRATED_PACKAGE_SIGNING_CERT_SHA256)
             .putString(KEY_CALIBRATED_CONTROLLER, testedIdentity.controllerId)
             .putString(KEY_CALIBRATED_APP_BUILD_ID, testedIdentity.micBridgeBuildId)
             .putInt(KEY_CALIBRATED_ANDROID_USER_ID, testedIdentity.androidUserId)
@@ -295,6 +259,7 @@ class SettingsRepository(context: Context) {
 
     fun clearCalibration() = synchronized(CALIBRATION_IDENTITY_LOCK) {
         preferences.edit()
+            .remove(KEY_CALIBRATED_SCOPE)
             .remove(KEY_CALIBRATED_SETTINGS_GENERATION)
             .remove(KEY_CALIBRATED_FINGERPRINT)
             .remove(KEY_CALIBRATED_ANDROID_BUILD_ID)
@@ -322,28 +287,9 @@ class SettingsRepository(context: Context) {
         preferences.getLong(KEY_CALIBRATED_AT, 0L).takeIf { it > 0L }
 
     /**
-     * Captures one complete, immutable identity for calibration step/commit comparisons.
-     *
-     * Every capture costs a `PackageManager` Binder round trip plus a SHA-256 over the signing
-     * certificate, and one guarded OPEN transition asks for it roughly six times (entry snapshot,
-     * pre-dispatch, post-open, commit, and once each inside the snapshot/operation builders).
-     * The result is therefore memoized for [CALIBRATION_IDENTITY_CACHE_MS] under the same
-     * [CALIBRATION_IDENTITY_LOCK] that serializes every mutation of this class, and every
-     * mutating path invalidates it eagerly via [invalidateCalibrationIdentityCache].
-     *
-     * Trade-off, stated precisely: a change that this class cannot observe — a target-package
-     * install/update, a permission revocation, or an Android build change — is seen at most
-     * 250 ms late. That is observationally identical to the same change landing 250 ms earlier,
-     * which the design must already tolerate, and it creates no new failure class:
-     *  - calibration validity is never part of the continuous `openAllowed` gate; it is only
-     *    ever evaluated at transition boundaries, each of which re-reads it,
-     *  - a stale-but-fresher-than-250 ms identity can only ever equal the value this call would
-     *    have returned 250 ms ago, so it can neither invent a match nor suppress a real
-     *    mismatch for longer than that window,
-     *  - the persisted proof compared against it ([storedAcousticCalibrationIdentity]) is not
-     *    cached, so any commit or clear takes effect immediately.
+     * Captures only the system control environment. Third-party app installation, permissions,
+     * signatures and updates cannot invalidate or prevent system microphone control.
      */
-    @Suppress("DEPRECATION")
     fun currentAcousticCalibrationIdentity(): AcousticCalibrationIdentity? =
         synchronized(CALIBRATION_IDENTITY_LOCK) {
             val cachedAt = calibrationIdentityCachedAtNanos
@@ -354,21 +300,9 @@ class SettingsRepository(context: Context) {
                 return@synchronized calibrationIdentityCache
             }
             val computed = runCatching {
-                val selectedGeneration = calibrationSettingsGeneration
-                val selectedController = controllerId
-                val selectedPackage = targetPackage
-                if (!targetCanCurrentlyRecord(selectedPackage)) return@runCatching null
-                val info = packageInfoWithSigningCertificates(selectedPackage)
-                val uid = info.applicationInfo?.uid ?: return@runCatching null
-                val signingDigest = signingCertificateSha256(info) ?: return@runCatching null
                 AcousticCalibrationIdentity(
-                    settingsGeneration = selectedGeneration,
-                    controllerId = selectedController,
-                    targetPackage = selectedPackage,
-                    targetPackageVersion = "${info.versionName}:${info.longVersionCode}",
-                    targetPackageUid = uid,
-                    targetPackageLastUpdateTimeEpochMs = info.lastUpdateTime,
-                    targetSigningCertificateSha256 = signingDigest,
+                    settingsGeneration = calibrationSettingsGeneration,
+                    controllerId = controllerId,
                     micBridgeBuildId = BuildConfig.MICBRIDGE_BUILD_ID,
                     androidBuildId = Build.ID,
                     androidFingerprint = Build.FINGERPRINT,
@@ -392,44 +326,12 @@ class SettingsRepository(context: Context) {
         }
     }
 
-    @Suppress("DEPRECATION")
-    private fun packageInfoWithSigningCertificates(packageName: String): PackageInfo =
-        if (Build.VERSION.SDK_INT >= 33) {
-            packageManager.getPackageInfo(
-                packageName,
-                PackageManager.PackageInfoFlags.of(
-                    PackageManager.GET_SIGNING_CERTIFICATES.toLong(),
-                ),
-            )
-        } else {
-            packageManager.getPackageInfo(
-                packageName,
-                PackageManager.GET_SIGNING_CERTIFICATES,
-            )
-        }
-
-    @Suppress("DEPRECATION")
-    private fun signingCertificateSha256(info: PackageInfo): String? {
-        val signers = info.signingInfo?.apkContentsSigners?.takeIf { it.isNotEmpty() }
-            ?: info.signatures?.takeIf { it.isNotEmpty() }
-            ?: return null
-        return signers.map { signature ->
-            MessageDigest.getInstance("SHA-256")
-                .digest(signature.toByteArray())
-                .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
-        }.sorted().joinToString(",")
-    }
-
     private fun storedAcousticCalibrationIdentity(): AcousticCalibrationIdentity? {
         if (
+            preferences.getString(KEY_CALIBRATED_SCOPE, null) != SYSTEM_CALIBRATION_SCOPE ||
             !preferences.contains(KEY_CALIBRATED_SETTINGS_GENERATION) ||
             !preferences.contains(KEY_CALIBRATED_FINGERPRINT) ||
             !preferences.contains(KEY_CALIBRATED_ANDROID_BUILD_ID) ||
-            !preferences.contains(KEY_CALIBRATED_PACKAGE) ||
-            !preferences.contains(KEY_CALIBRATED_PACKAGE_VERSION) ||
-            !preferences.contains(KEY_CALIBRATED_PACKAGE_UID) ||
-            !preferences.contains(KEY_CALIBRATED_PACKAGE_LAST_UPDATE_TIME) ||
-            !preferences.contains(KEY_CALIBRATED_PACKAGE_SIGNING_CERT_SHA256) ||
             !preferences.contains(KEY_CALIBRATED_CONTROLLER) ||
             !preferences.contains(KEY_CALIBRATED_APP_BUILD_ID) ||
             !preferences.contains(KEY_CALIBRATED_ANDROID_USER_ID)
@@ -441,21 +343,6 @@ class SettingsRepository(context: Context) {
             ),
             controllerId = preferences.getString(KEY_CALIBRATED_CONTROLLER, null)
                 ?: return null,
-            targetPackage = preferences.getString(KEY_CALIBRATED_PACKAGE, null)
-                ?: return null,
-            targetPackageVersion = preferences.getString(
-                KEY_CALIBRATED_PACKAGE_VERSION,
-                null,
-            ) ?: return null,
-            targetPackageUid = preferences.getInt(KEY_CALIBRATED_PACKAGE_UID, -1),
-            targetPackageLastUpdateTimeEpochMs = preferences.getLong(
-                KEY_CALIBRATED_PACKAGE_LAST_UPDATE_TIME,
-                -1L,
-            ),
-            targetSigningCertificateSha256 = preferences.getString(
-                KEY_CALIBRATED_PACKAGE_SIGNING_CERT_SHA256,
-                null,
-            ) ?: return null,
             micBridgeBuildId = preferences.getString(KEY_CALIBRATED_APP_BUILD_ID, null)
                 ?: return null,
             androidBuildId = preferences.getString(KEY_CALIBRATED_ANDROID_BUILD_ID, null)
@@ -470,10 +357,6 @@ class SettingsRepository(context: Context) {
         return AuthGuard.generateToken()
     }
 
-    private fun targetCanCurrentlyRecord(packageName: String): Boolean =
-        packageManager.checkPermission(Manifest.permission.RECORD_AUDIO, packageName) ==
-            android.content.pm.PackageManager.PERMISSION_GRANTED
-
     private fun appUserId(): Int = Process.myUid() / PER_USER_RANGE
 
     private val calibrationSettingsGeneration: Long
@@ -483,6 +366,8 @@ class SettingsRepository(context: Context) {
         const val CONTROLLER_APP_OPS = "root_appops"
         const val CONTROLLER_AUDIO_MANAGER = "audio_manager"
         const val CONTROLLER_SENSOR_PRIVACY = "root_sensor_privacy"
+        const val GLOBAL_MIC_TARGET = "android-global-microphone"
+        // Used only when reading old experimental AppOps metadata.
         const val DEFAULT_CHATGPT_PACKAGE = "com.openai.chatgpt"
         const val DEFAULT_PORT = 8787
         const val DEFAULT_MAX_OPEN_SECONDS = 30
@@ -512,6 +397,8 @@ class SettingsRepository(context: Context) {
         private const val KEY_AUTO_START = "auto_start"
         private const val KEY_RELIABLE_MODE = "reliable_mode"
         private const val KEY_ROOT_BOOT_GUARD = "root_boot_guard_installed"
+        private const val KEY_CALIBRATED_SCOPE = "calibrated_scope"
+        private const val SYSTEM_CALIBRATION_SCOPE = "system_microphone_v1"
         private const val KEY_CALIBRATED_FINGERPRINT = "calibrated_fingerprint"
         private const val KEY_CALIBRATED_SETTINGS_GENERATION =
             "calibrated_settings_generation"
@@ -531,11 +418,7 @@ class SettingsRepository(context: Context) {
         private val RESTORABLE_APPOPS_MODES = setOf("allow", "default")
         private val CALIBRATION_IDENTITY_LOCK = Any()
 
-        /**
-         * Maximum age of a memoized acoustic-calibration identity. Bounds how late an
-         * externally caused identity change (package update, permission change, Android build
-         * change) can be observed; see [currentAcousticCalibrationIdentity].
-         */
+        /** Maximum age of a memoized system identity; local controller changes invalidate it. */
         private const val CALIBRATION_IDENTITY_CACHE_MS = 250L
     }
 }

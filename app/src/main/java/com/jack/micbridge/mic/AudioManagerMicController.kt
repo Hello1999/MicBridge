@@ -21,7 +21,7 @@ class AudioManagerMicController(
         ProbeResult(
             available = state != MicAccessState.UNKNOWN,
             stateReadable = state != MicAccessState.UNKNOWN,
-            notes = "平台 API 只提供控制读回，仍需 ChatGPT Live 声学校准",
+            notes = "平台 API 只提供控制读回，仍需用录音应用验证实际收音",
         )
     }
 

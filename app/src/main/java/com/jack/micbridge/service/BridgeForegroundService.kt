@@ -36,7 +36,7 @@ import com.jack.micbridge.data.RequestLedger
 import com.jack.micbridge.data.SettingsRepository
 import com.jack.micbridge.data.SafetyTarget
 import com.jack.micbridge.mic.AppOpsModeReader
-import com.jack.micbridge.mic.AppOpsReadOnlyOpenVeto
+import com.jack.micbridge.mic.ForegroundUserMicController
 import com.jack.micbridge.mic.AudioManagerMicController
 import com.jack.micbridge.mic.ControllerFactory
 import com.jack.micbridge.mic.MicController
@@ -298,6 +298,15 @@ class BridgeForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action ?: ACTION_START
+        if (action == ACTION_REFRESH_STATE) {
+            // Returning from another app or Settings is only a prompt to inspect real changes.
+            // It must not itself revoke an active microphone or calibration lease.
+            if (!shuttingDown) {
+                refreshPreparationStatus()
+                wakeSafetyMonitors()
+            }
+            return START_STICKY
+        }
         val maintenanceOperation = action == ACTION_STOP || action == ACTION_REMOVE_GUARD
         val maintenanceGenerationAtDispatch = synchronized(maintenanceBoundaryLock) {
             if (maintenanceOperation) {
@@ -416,6 +425,20 @@ class BridgeForegroundService : Service() {
                     return@launch
                 }
                 when (action) {
+                    ACTION_TOGGLE -> {
+                        calibrationMutex.withLock {
+                            val result = if (calibrationBoundaryActive) {
+                                // A local tap cannot convert temporary calibration evidence into
+                                // a persistent OPEN or resume an interrupted calibration round.
+                                calibrationSession.reset()
+                                coordinator.localBlock("local-toggle-during-calibration")
+                            } else {
+                                coordinator.localToggle()
+                            }
+                            queueStateChangeCue(result)
+                            publishCurrent(result.errorMessage)
+                        }
+                    }
                     ACTION_BLOCK -> {
                         calibrationMutex.withLock {
                             calibrationSession.reset()
@@ -462,7 +485,7 @@ class BridgeForegroundService : Service() {
                             if (!calibrationSession.beginOpenAttempt(identity)) {
                                 coordinator.localBlock("calibration-identity-unavailable")
                                 publishCurrent(
-                                    "无法冻结校准环境；请确认目标 ChatGPT 包、录音权限、签名和当前用户",
+                                    "无法确认系统验证环境；请检查控制方式和当前 Android 用户",
                                 )
                             } else {
                                 val opened = coordinator.calibrationOpen()
@@ -471,7 +494,7 @@ class BridgeForegroundService : Service() {
                                 if (current != identity) {
                                     calibrationSession.reset()
                                     coordinator.localBlock("calibration-identity-changed-open")
-                                    publishCurrent("校准期间目标应用或系统环境已变化；本轮作废并已屏蔽")
+                                    publishCurrent("校准期间系统或控制方式已变化；本轮作废并已屏蔽")
                                 }
                             }
                         }
@@ -491,13 +514,10 @@ class BridgeForegroundService : Service() {
                                 val isolated = coordinator.calibrationIsolateRootFailsafe(
                                     rootGate = calibrationRootGate,
                                     audioGate = AudioManagerMicController(audioManager),
-                                    appOpsVeto = AppOpsReadOnlyOpenVeto(
-                                        rootShell,
-                                        settings,
-                                        AppOpsReadOnlyOpenVeto.inProcessForegroundUserCheck(
+                                    targetUserIsForeground =
+                                        ForegroundUserMicController.inProcessForegroundUserCheck(
                                             this@BridgeForegroundService,
                                         ),
-                                    ),
                                     // Keep the fast audible cut inside the coordinator mutex so
                                     // the 250 ms drift monitor cannot mistake this intentional
                                     // split state for an external mutation and revoke the round.
@@ -514,7 +534,7 @@ class BridgeForegroundService : Service() {
                                 if (!identityStable) {
                                     coordinator.localBlock("calibration-identity-changed-isolation")
                                     publishCurrent(
-                                        "Root-only 测试期间目标应用或系统环境已变化；本轮作废并已屏蔽",
+                                        "Root-only 测试期间系统或控制方式已变化；本轮作废并已屏蔽",
                                     )
                                 } else if (!verified) {
                                     publishCurrent(
@@ -539,13 +559,10 @@ class BridgeForegroundService : Service() {
                                 val confirmed = coordinator.confirmRootIsolationAndBlock(
                                     rootGate = SensorPrivacyRootController(rootShell),
                                     audioGate = AudioManagerMicController(audioManager),
-                                    appOpsVeto = AppOpsReadOnlyOpenVeto(
-                                        rootShell,
-                                        settings,
-                                        AppOpsReadOnlyOpenVeto.inProcessForegroundUserCheck(
+                                    targetUserIsForeground =
+                                        ForegroundUserMicController.inProcessForegroundUserCheck(
                                             this@BridgeForegroundService,
                                         ),
-                                    ),
                                 )
                                 val after = settings.currentAcousticCalibrationIdentity()
                                 val identityStable = calibrationSession.matchesCurrentIdentity(after)
@@ -559,7 +576,7 @@ class BridgeForegroundService : Service() {
                                 if (!identityStable) {
                                     coordinator.localBlock("calibration-identity-changed-confirm")
                                     publishCurrent(
-                                        "确认期间目标应用或系统环境已变化；本轮作废并已屏蔽",
+                                        "确认期间系统或控制方式已变化；本轮作废并已屏蔽",
                                     )
                                 } else if (!verified) {
                                     publishCurrent(
@@ -663,6 +680,9 @@ class BridgeForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private suspend fun initialize() {
+        if (!rootShell.hasRoot()) {
+            throw InitializationFailure("未获得 Root 权限；请在 Root 管理器中允许 MicBridge")
+        }
         if (!networkMonitoringReady) registerNetworkCallback()
         if (!isNetworkAddressMonitorReady()) {
             startNetworkAddressMonitor()
@@ -672,8 +692,10 @@ class BridgeForegroundService : Service() {
         if (!isPermissionMonitorReady()) startPermissionMonitor()
         if (!::coordinator.isInitialized) {
             safety = AutoBlockSafety(this, settings, rootShell)
-            check(safety.claimRootWorkspaceOwner()) {
-                "Root 工作区已被另一个 Android 用户实例占用，或无法取得安全所有权"
+            if (!safety.claimRootWorkspaceOwner()) {
+                throw InitializationFailure(
+                    "Root 保护目录不可用或被其他 Android 用户占用；请检查 Root 授权并切回安装应用的用户",
+                )
             }
             controller = ControllerFactory.create(this, settings, rootShell)
             coordinator = MicCoordinator(
@@ -697,6 +719,7 @@ class BridgeForegroundService : Service() {
                         hasVisibleNotificationPermission() &&
                         isBatteryOptimizationExempt()
                 },
+                normalOpenAllowed = { !calibrationBoundaryActive },
                 remoteOpenAllowed = { generation ->
                     !shuttingDown &&
                         !stopCommittedBoundaryActive &&
@@ -722,15 +745,15 @@ class BridgeForegroundService : Service() {
             )
         }
         val startupBlock = coordinator.initialize()
-        check(isSafeStartupBoundary(startupBlock)) {
-            "启动 BLOCK 未获得新鲜可验证读回"
+        if (!isSafeStartupBoundary(startupBlock)) {
+            throw InitializationFailure("系统麦克风屏蔽未能确认；请检查 Root 授权与系统兼容性")
         }
         // Move the comparatively expensive immutable boot-guard deployment out of the user's
         // OPEN button path. AutoBlockSafety keeps an in-process proof for this exact target;
         // every OPEN still arms a fresh per-lease watcher and revalidates the live supervisor.
         if (settings.rootBootGuardInstalled) {
-            check(safety.installOrRefreshRootBootGuard()) {
-                "已配置的 Root 开机保护无法在服务启动时刷新"
+            if (!safety.installOrRefreshRootBootGuard()) {
+                throw InitializationFailure("开机保护更新失败；请在设置中重新安装系统保护")
             }
         }
         val probe = controller.probe()
@@ -739,17 +762,19 @@ class BridgeForegroundService : Service() {
             append(probe.worksWhileLocked?.toString() ?: "NOT_RUN")
             probe.notes?.takeIf { it.isNotBlank() }?.let { append("；").append(it) }
         }
-        check(probe.available && probe.stateReadable) {
-            "控制器自动探测未通过：$controllerProbeSummary"
+        if (!probe.available || !probe.stateReadable) {
+            throw InitializationFailure("无法读取系统麦克风开关；请检查 Root 授权与系统兼容性")
         }
         if (settings.reliableMode && !isReliabilityReady()) acquireWakeLock()
-        check(
-            networkMonitoringReady && isNetworkAddressMonitorReady() && micMuteMonitoringReady &&
-                isPermissionMonitorReady() && isReliabilityReady()
+        if (
+            !networkMonitoringReady || !isNetworkAddressMonitorReady() || !micMuteMonitoringReady ||
+                !isPermissionMonitorReady() || !isReliabilityReady()
         ) {
-            "网络、麦克风漂移、权限变化监控或可靠模式未就绪"
+            throw InitializationFailure("后台保护监控尚未就绪；请检查通知权限与电池后台限制")
         }
-        check(bootIncidentStore.clear()) { "无法清除已解决的开机安全告警" }
+        if (!bootIncidentStore.clear()) {
+            throw InitializationFailure("无法保存启动检查结果；请检查设备剩余存储空间")
+        }
         initialized = true
         wakeSafetyMonitors()
         if (
@@ -804,7 +829,10 @@ class BridgeForegroundService : Service() {
                     bootIncidentStore.record("服务初始化失败且备用 BLOCK 无法确认；麦克风状态未知")
                     bootIncidentStore.postFailureNotification()
                 }
-                val message = "初始化失败（${error.javaClass.simpleName}）；HTTP 未开放，5 秒后重试"
+                val reason = (error as? InitializationFailure)?.userMessage
+                    ?: "启动检查遇到异常，请查看诊断信息"
+                Log.w(TAG, "Initialization failed: ${error.javaClass.simpleName}")
+                val message = "$reason；远程控制未启用，5 秒后重试"
                 val snapshot = ServiceRuntime.snapshot.value.copy(
                     micAccess = if (blocked) MicAccessState.BLOCKED else MicAccessState.UNKNOWN,
                     transitioning = false,
@@ -1513,9 +1541,9 @@ class BridgeForegroundService : Service() {
                 when {
                     !safeBoundary -> "校准提交失败：最终 BLOCKED 或安全租约清理无法确认"
                     !sequenceObserved ->
-                        "校准提交失败：本次服务会话未记录 OPEN→Root-only+AppOps允许→确认并完整BLOCKED 序列"
-                    saved -> "校准提交失败：保存后目标应用或系统身份已变化；旧证据已撤销"
-                    else -> "校准提交失败：目标包、录音权限或校准记录无法确认"
+                        "校准提交失败：本次服务会话未记录 开放→系统隐私开关单独屏蔽→确认并完整屏蔽 序列"
+                    saved -> "校准提交失败：保存后系统身份已变化；旧证据已撤销"
+                    else -> "校准提交失败：系统环境或验证记录无法确认"
                 },
             )
         }
@@ -1591,16 +1619,7 @@ class BridgeForegroundService : Service() {
                 PERMISSION_LOCAL_NETWORK,
             ) == PackageManager.PERMISSION_GRANTED
 
-    private fun hasVisibleNotificationPermission(): Boolean {
-        val runtimeGranted = android.os.Build.VERSION.SDK_INT < 33 ||
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
-            PackageManager.PERMISSION_GRANTED
-        if (!runtimeGranted) return false
-        val manager = getSystemService(NotificationManager::class.java)
-        if (!manager.areNotificationsEnabled()) return false
-        val channel = manager.getNotificationChannel(CHANNEL_ID) ?: return false
-        return channel.importance != NotificationManager.IMPORTANCE_NONE
-    }
+    private fun hasVisibleNotificationPermission(): Boolean = hasVisibleNotificationPermission(this)
 
     private fun isBatteryOptimizationExempt(): Boolean = runCatching {
         getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
@@ -1790,9 +1809,7 @@ class BridgeForegroundService : Service() {
         runCatching {
             permissionMonitorJob?.cancel()
             permissionsUsable =
-                hasLocalNetworkPermission() && hasVisibleNotificationPermission() &&
-                    isAppUserForeground() && isReliabilityReady() &&
-                    isBatteryOptimizationExempt()
+                hasLocalNetworkPermission() && hasCoreControlPermissions()
 
             lateinit var monitor: Job
             monitor = scope.launch(start = CoroutineStart.LAZY) {
@@ -1854,46 +1871,53 @@ class BridgeForegroundService : Service() {
     }
 
     private suspend fun runPermissionMonitorIteration() {
-        val usable =
-            hasLocalNetworkPermission() &&
-                hasVisibleNotificationPermission() &&
-                isAppUserForeground() &&
-                isReliabilityReady() &&
-                isBatteryOptimizationExempt()
-        val previous = synchronized(permissionStateLock) {
+        refreshPreparationStatus()
+        val coreUsable = hasCoreControlPermissions()
+        val lanGranted = hasLocalNetworkPermission()
+        val remoteUsable = coreUsable && lanGranted
+        val previousRemoteUsable = synchronized(permissionStateLock) {
             val old = permissionsUsable
-            permissionsUsable = usable
+            permissionsUsable = remoteUsable
             old
         }
         val snapshotAtCheck = ServiceRuntime.snapshot.value
+        val remoteAuthority = boundAddresses.isNotEmpty() || allHttpServers.isNotEmpty()
         val activeAuthorityOrLease =
-            boundAddresses.isNotEmpty() || allHttpServers.isNotEmpty() ||
-                snapshotAtCheck.micAccess == MicAccessState.OPEN ||
+            remoteAuthority || snapshotAtCheck.micAccess == MicAccessState.OPEN ||
                 snapshotAtCheck.transitioning ||
                 snapshotAtCheck.autoBlockAtEpochMs != null ||
                 snapshotAtCheck.leaseExactAlarmArmed != null ||
                 snapshotAtCheck.leaseRootWatchdogArmed != null
-        if (!usable && activeAuthorityOrLease) {
-            // Android exposes no single listener covering runtime grants, a user-disabled
-            // notification/channel, foreground-user changes, and battery exemption. Treat the
-            // condition as a level, not merely a true->false edge: the monitor may have started
-            // before the WakeLock and listener became ready.
-            revokeAndCloseHttpServers()
-            if (initialized) {
-                val blocked = coordinator.localBlock("permission-revoked")
-                publishCurrent(
-                    if (isSafeStoppedBoundary(blocked)) {
-                        "必要权限、通知可见性、前台用户或电池豁免已变化；已关闭 HTTP 并确认屏蔽"
-                    } else {
-                        "必要权限、通知可见性、前台用户或电池豁免已变化；HTTP 已关闭但屏蔽无法确认"
-                    },
-                )
+        when (permissionSafetyAction(
+            corePermissionsUsable = coreUsable,
+            localNetworkPermissionGranted = lanGranted,
+            previousRemotePermissionsUsable = previousRemoteUsable,
+            hasRemoteAuthority = remoteAuthority,
+            hasActiveAuthorityOrLease = activeAuthorityOrLease,
+        )) {
+            PermissionSafetyAction.REVOKE_AND_BLOCK -> {
+                // Missing LAN permission alone cannot prevent local system control. Revoking
+                // existing remote authority still closes its microphone lease fail-closed.
+                revokeAndCloseHttpServers()
+                if (initialized) {
+                    val blocked = coordinator.localBlock("permission-revoked")
+                    publishCurrent(
+                        if (isSafeStoppedBoundary(blocked)) {
+                            "系统保护条件或远程连接权限已变化；已关闭远程控制并确认屏蔽"
+                        } else {
+                            "系统保护条件或远程连接权限已变化；远程控制已关闭但屏蔽无法确认"
+                        },
+                    )
+                }
             }
-        } else if (!previous && usable && initialized && !shuttingDown) {
-            scheduleNetworkRefresh()
+            PermissionSafetyAction.REFRESH_REMOTE -> if (initialized && !shuttingDown) {
+                scheduleNetworkRefresh()
+            }
+            PermissionSafetyAction.NONE -> Unit
         }
+        // A local OPEN needs the same continuous Root guard proof even without LAN permission.
         if (
-            usable && initialized && !shuttingDown &&
+            coreUsable && initialized && !shuttingDown &&
             ServiceRuntime.snapshot.value.micAccess == MicAccessState.OPEN
         ) {
             val guardHealthy = coordinator.activeRootGuardHealthy()
@@ -1910,6 +1934,10 @@ class BridgeForegroundService : Service() {
             }
         }
     }
+
+    private fun hasCoreControlPermissions(): Boolean =
+        hasVisibleNotificationPermission() && isAppUserForeground() &&
+            isReliabilityReady() && isBatteryOptimizationExempt()
 
     private fun isPermissionMonitorReady(): Boolean =
         permissionMonitoringReady && permissionMonitorJob?.isActive == true
@@ -2037,13 +2065,13 @@ class BridgeForegroundService : Service() {
             !snapshot.controlReadback || snapshot.micAccess == MicAccessState.UNKNOWN ->
                 "MicBridge：状态无法确认"
             snapshot.micAccess == MicAccessState.BLOCKED && snapshot.acousticCalibrationValid ->
-                "MicBridge：麦克风访问已屏蔽"
+                "MicBridge：系统麦克风已屏蔽"
             snapshot.micAccess == MicAccessState.BLOCKED ->
-                "MicBridge：控制层已屏蔽，声学未校准"
-            snapshot.acousticCalibrationValid -> "MicBridge：麦克风访问已开放"
-            else -> "MicBridge：临时开放，声学未校准"
+                "MicBridge：已屏蔽，等待首次验证"
+            snapshot.acousticCalibrationValid -> "MicBridge：系统麦克风已开放"
+            else -> "MicBridge：临时开放，正在验证"
         }
-        val address = snapshot.serverAddresses.firstOrNull() ?: "HTTP 未监听"
+        val address = snapshot.serverAddresses.firstOrNull() ?: "远程控制未连接"
         val detail = snapshot.lastError ?: when {
             snapshot.micAccess == MicAccessState.OPEN && snapshot.autoBlockAtEpochMs != null ->
                 "$address · 最迟约 ${
@@ -2051,7 +2079,7 @@ class BridgeForegroundService : Service() {
                         .coerceAtLeast(0L)
                 } 秒后自动屏蔽"
             snapshot.micAccess == MicAccessState.OPEN ->
-                "$address · 持续开放；再次按 Action Button 屏蔽"
+                "$address · 持续开放；点“立即屏蔽”关闭"
             else -> "$address · ${controllerName(snapshot.controllerId)}"
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -2060,7 +2088,7 @@ class BridgeForegroundService : Service() {
             .setContentText(detail)
             .setStyle(NotificationCompat.BigTextStyle().bigText(detail))
             .setOngoing(true)
-            .setOnlyAlertOnce(snapshot.lastError == null)
+            .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(
                 if (snapshot.lastError != null || snapshot.micAccess == MicAccessState.UNKNOWN) {
@@ -2072,6 +2100,19 @@ class BridgeForegroundService : Service() {
             .addAction(0, "立即屏蔽", blockIntent)
             .addAction(0, "屏蔽后停止", stopIntent)
             .build()
+    }
+
+    /** Refresh setup readiness without reading or rewriting microphone/lease evidence. */
+    private fun refreshPreparationStatus() {
+        synchronized(publicationLock) {
+            if (shuttingDown || terminalPublication) return
+            val current = ServiceRuntime.snapshot.value
+            val batteryExempt = isBatteryOptimizationExempt()
+            if (current.batteryOptimizationExempt == batteryExempt) return
+            val refreshed = current.copy(batteryOptimizationExempt = batteryExempt)
+            ServiceRuntime.publish(refreshed)
+            updateNotificationUnconditionally(refreshed)
+        }
     }
 
     private fun updateNotification(snapshot: BridgeSnapshot) {
@@ -2098,8 +2139,8 @@ class BridgeForegroundService : Service() {
 
     private fun controllerName(id: String): String = when (id) {
         SettingsRepository.CONTROLLER_APP_OPS -> "Root AppOps"
-        SettingsRepository.CONTROLLER_AUDIO_MANAGER -> "AudioManager"
-        SettingsRepository.CONTROLLER_SENSOR_PRIVACY -> "Root sensor_privacy"
+        SettingsRepository.CONTROLLER_AUDIO_MANAGER -> "系统音频控制"
+        SettingsRepository.CONTROLLER_SENSOR_PRIVACY -> "系统隐私开关"
         else -> id
     }
 
@@ -2340,6 +2381,9 @@ class BridgeForegroundService : Service() {
         }
     }
 
+    /** Only fixed, non-sensitive recovery text may be surfaced from initialization failures. */
+    private class InitializationFailure(val userMessage: String) : IllegalStateException()
+
     private data class NetworkObservation(
         var capabilities: NetworkCapabilities? = null,
         var linkProperties: LinkProperties? = null,
@@ -2349,6 +2393,7 @@ class BridgeForegroundService : Service() {
     companion object {
         private const val TAG = "MicBridgeService"
         const val ACTION_START = "com.jack.micbridge.START"
+        const val ACTION_TOGGLE = "com.jack.micbridge.TOGGLE"
         const val ACTION_BLOCK = "com.jack.micbridge.BLOCK"
         const val ACTION_CALIBRATION_OPEN = "com.jack.micbridge.CALIBRATION_OPEN"
         const val ACTION_CALIBRATION_ROOT_ISOLATION =
@@ -2357,12 +2402,25 @@ class BridgeForegroundService : Service() {
             "com.jack.micbridge.CALIBRATION_CONFIRM_AND_BLOCK"
         const val ACTION_COMPLETE_CALIBRATION = "com.jack.micbridge.COMPLETE_CALIBRATION"
         const val ACTION_REFRESH = "com.jack.micbridge.REFRESH"
+        const val ACTION_REFRESH_STATE = "com.jack.micbridge.REFRESH_STATE"
         const val ACTION_INSTALL_GUARD = "com.jack.micbridge.INSTALL_GUARD"
         const val ACTION_REMOVE_GUARD = "com.jack.micbridge.REMOVE_GUARD"
         const val ACTION_STOP = "com.jack.micbridge.STOP"
         const val PERMISSION_LOCAL_NETWORK = "android.permission.ACCESS_LOCAL_NETWORK"
 
-        private const val CHANNEL_ID = "micbridge_status"
+        internal const val CHANNEL_ID = "micbridge_status"
+
+        /** Shared with setup UI so its readiness matches the actual OPEN requirement. */
+        fun hasVisibleNotificationPermission(context: Context): Boolean {
+            val runtimeGranted = android.os.Build.VERSION.SDK_INT < 33 ||
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
+            if (!runtimeGranted) return false
+            val manager = context.getSystemService(NotificationManager::class.java)
+            if (!manager.areNotificationsEnabled()) return false
+            val channel = manager.getNotificationChannel(CHANNEL_ID) ?: return false
+            return channel.importance != NotificationManager.IMPORTANCE_NONE
+        }
         private const val OPEN_PERMISSION_MONITOR_INTERVAL_MS = 250L
         private const val ACTIVE_PERMISSION_MONITOR_INTERVAL_MS = 2_000L
         private const val PERMISSION_MONITOR_RETRY_MS = 1_000L

@@ -2,7 +2,7 @@ package com.jack.micbridge.mic
 
 /**
  * Strictly read-only AppOps parser/reader. Release code deliberately contains no AppOps write
- * controller: AppOps is only an OPEN veto and a legacy-metadata inspection source.
+ * controller: AppOps is retained only to inspect metadata from older experimental installations.
  */
 class AppOpsModeReader(
     private val shell: RootShell,
@@ -71,7 +71,7 @@ class AppOpsModeReader(
                 .toList()
 
             // Never ignore an unrecognized or ambiguous scope and then fall through to a more
-            // permissive one. A future/OEM mode such as `ask` must veto OPEN as UNKNOWN.
+            // permissive one. A future/OEM mode such as `ask` remains unknown during legacy inspection.
             if (uidLabels != uidValues.size || packageLabels != packageValues.size) return null
             if ((uidValues + packageValues).any { it !in KNOWN_MODES }) return null
             if (uidValues.distinct().size > 1 || packageValues.distinct().size > 1) return null

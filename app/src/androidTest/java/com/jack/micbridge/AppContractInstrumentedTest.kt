@@ -216,7 +216,7 @@ class AppContractInstrumentedTest {
     }
 
     @Test
-    fun pendingAppOpsStateLocksControllerAndTargetUntilSafeCleanup() {
+    fun pendingAppOpsCleanupKeepsCapturedPackageIndependentOfLegacyTarget() {
         val settings = SettingsRepository(context)
         val originalController = settings.controllerId
         val originalPackage = settings.targetPackage
@@ -240,15 +240,51 @@ class AppContractInstrumentedTest {
                     else SettingsRepository.CONTROLLER_AUDIO_MANAGER
                 }.isFailure,
             )
-            assertTrue(
-                runCatching { settings.targetPackage = "com.example.other" }.isFailure,
-            )
+            val identity = settings.currentAcousticCalibrationIdentity()
+            settings.targetPackage = "com.example.other"
             assertEquals(originalController, settings.controllerId)
-            assertEquals(SettingsRepository.DEFAULT_CHATGPT_PACKAGE, settings.targetPackage)
+            assertEquals(SettingsRepository.DEFAULT_CHATGPT_PACKAGE, settings.originalAppOpsPackage)
+            assertEquals(identity, settings.currentAcousticCalibrationIdentity())
+            assertEquals(SettingsRepository.GLOBAL_MIC_TARGET, DirectBootSettings(context).targetPackage)
         } finally {
             settings.originalAppOpsMode = null
             settings.controllerId = originalController
             settings.targetPackage = originalPackage
+        }
+    }
+
+    @Test
+    fun systemCalibrationDoesNotRequireAnInstalledRecordingApp() {
+        val settings = SettingsRepository(context)
+        val originalPackage = settings.targetPackage
+        try {
+            settings.targetPackage = "com.example.micbridge.nonexistent"
+            val identity = requireNotNull(settings.currentAcousticCalibrationIdentity())
+            assertEquals(android.os.Process.myUid() / 100_000, identity.androidUserId)
+            assertEquals(settings.controllerId, identity.controllerId)
+            assertEquals(BuildConfig.MICBRIDGE_BUILD_ID, identity.micBridgeBuildId)
+            // Changing even to an invalid old package cannot select or invalidate a system gate.
+            settings.targetPackage = "legacy-metadata-only"
+            assertEquals(identity, SettingsRepository(context).currentAcousticCalibrationIdentity())
+            assertEquals(SettingsRepository.GLOBAL_MIC_TARGET, DirectBootSettings(context).targetPackage)
+        } finally {
+            settings.targetPackage = originalPackage
+        }
+    }
+
+    @Test
+    fun oldAppScopedCalibrationCannotAuthorizeSystemControl() {
+        val settings = SettingsRepository(context)
+        val preferences = context.getSharedPreferences("micbridge_settings", android.content.Context.MODE_PRIVATE)
+        try {
+            val identity = requireNotNull(settings.currentAcousticCalibrationIdentity())
+            assertTrue(settings.markAcousticCalibrationPassed(identity))
+            assertTrue(settings.isAcousticCalibrationValid())
+            // Old installations have identity fields but no explicit system scope.
+            assertTrue(preferences.edit().remove("calibrated_scope").commit())
+            assertFalse(SettingsRepository(context).isAcousticCalibrationValid())
+        } finally {
+            settings.clearCalibration()
         }
     }
 

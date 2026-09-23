@@ -35,14 +35,9 @@ object ControllerFactory {
                 },
             )
         }
-        return ReadOnlyOpenVetoMicController(
+        return ForegroundUserMicController(
             primary = selected,
-            vetoName = "ChatGPT AppOps",
-            veto = AppOpsReadOnlyOpenVeto(
-                rootShell,
-                settings,
-                AppOpsReadOnlyOpenVeto.inProcessForegroundUserCheck(context),
-            ),
+            targetUserIsForeground = ForegroundUserMicController.inProcessForegroundUserCheck(context),
         )
     }
 }

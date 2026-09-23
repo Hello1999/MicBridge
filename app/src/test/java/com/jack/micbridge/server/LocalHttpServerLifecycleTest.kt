@@ -45,7 +45,6 @@ class LocalHttpServerLifecycleTest {
     @Test
     fun `one peer cannot occupy every worker with simultaneous requests`() {
         val twoEntered = CountDownLatch(2)
-        val twoFinished = CountDownLatch(2)
         val release = CountDownLatch(1)
         val port = ServerSocket(0).use { it.localPort }
         val server = LocalHttpServer(
@@ -53,7 +52,6 @@ class LocalHttpServerLifecycleTest {
             HttpRequestRouter {
                 twoEntered.countDown()
                 check(release.await(5, TimeUnit.SECONDS))
-                twoFinished.countDown()
                 HttpResponse(200, "{\"ok\":true}")
             },
         )
@@ -84,17 +82,36 @@ class LocalHttpServerLifecycleTest {
             assertEquals("same-peer over-capacity connection should close promptly", -1, read)
 
             release.countDown()
-            assertTrue(twoFinished.await(3, TimeUnit.SECONDS))
-            clients.take(2).forEach { runCatching { it.close() } }
-            val recoveredResponse = Socket(address, port).use { recovered ->
-                recovered.soTimeout = 3_000
-                recovered.getOutputStream().apply {
-                    write("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n".toByteArray())
-                    flush()
-                }
-                recovered.getInputStream().bufferedReader().readText()
+            clients.take(2).forEach { client ->
+                val response = client.getInputStream().bufferedReader().readText()
+                assertTrue(response.startsWith("HTTP/1.1 200 OK"))
+                client.close()
             }
-            assertTrue(recoveredResponse.startsWith("HTTP/1.1 200 OK"))
+            // EOF proves each response completed, but handle() closes its socket just before
+            // the worker's finally removes it from the per-peer set. Retry only a capacity
+            // close/reset during that bounded cleanup window; a timeout or HTTP error still fails.
+            val recoveryDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+            var recoveredResponse: String
+            do {
+                recoveredResponse = try {
+                    Socket(address, port).use { recovered ->
+                        recovered.soTimeout = 3_000
+                        recovered.getOutputStream().apply {
+                            write("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n".toByteArray())
+                            flush()
+                        }
+                        recovered.getInputStream().bufferedReader().readText()
+                    }
+                } catch (_: SocketException) {
+                    ""
+                }
+                if (recoveredResponse.isNotEmpty()) break
+                Thread.sleep(10L)
+            } while (System.nanoTime() < recoveryDeadline)
+            assertTrue(
+                "peer capacity should recover after completed responses",
+                recoveredResponse.startsWith("HTTP/1.1 200 OK"),
+            )
 
         } finally {
             release.countDown()

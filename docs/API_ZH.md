@@ -1,8 +1,12 @@
 # MicBridge 本地 HTTP API
 
+API 控制 Android 系统麦克风，作用于全局 AudioManager 与 sensor privacy 门，不针对应用包名。恢复系统门不会授予应用录音权限，也不表示某个应用已开始收音。端点、认证与请求/响应格式保持兼容。
+
 默认端口 `8787`。服务器仅在启动屏蔽获得可信控制读回后，绑定可建立完整身份监控的局域网 IPv4，不绑定 `0.0.0.0`。API 31–35 只使用 `ConnectivityManager` 网络回调明确标识的可信同一 Wi‑Fi 地址；Android 自建热点仅在 API 36+ 且 `TetheringManager` 回调成功注册、明确报告下游接口名时支持。仅凭 site-local IP 或熟悉的网关地址不会将接口认作热点。接口名前缀 `lo`、`rmnet`、`ccmni`、`pdp`、`tun`、`tap`、`wg`、`ipsec`、`dummy` 会被排除。若受监控的多个合格接口同时存在，API 会在其所有合格地址上可达。无合格地址或基础 `ConnectivityManager` 监控注册失败时保持 BLOCKED 且不监听；只有 `TetheringManager` 注册失败时，热点路径禁用，但仍可绑定受监控的同一 Wi‑Fi。每个连接只处理一个 HTTP/1.1 请求并关闭。OPEN 时任一已注册网络出现、丢失或链路属性变化都会撤销当前 listener generation、关闭旧连接并串行确认 BLOCKED，随后才重新枚举和监听；仅 iPhone 离开热点而 Android 热点/IP 不变无法由无 heartbeat 的协议即时检测。
 
-本文件描述协议与实现边界，不是目标设备验收声明。Root watcher/supervisor、锁屏/熄屏、网络切换、Action Button 和 ChatGPT Live 声学结果在目标 Android/iPhone 实测前都不得标记为通过。
+本文件描述协议与实现边界，不是目标设备验收声明。Root watcher/supervisor、锁屏/熄屏、网络切换、Action Button 和测试应用声学结果在目标 Android/iPhone 实测前都不得标记为通过。
+
+Android 首页的本地控制不需要 HTTP listener 或本地网络权限；本地与远程共用系统控制状态机，但只有远程请求经过网络授权。缺少 LAN 权限只禁用远程访问；实际撤销已有远程权限仍先关闭监听并安全屏蔽。持续 toggle 不要求精确闹钟；临时 `/open` 和设备验证必须具备精确闹钟权限。
 
 ## 通用响应字段
 
@@ -13,7 +17,7 @@
 | `verified` | `control_readback && acoustic_calibration_valid` 的兼容字段 |
 | `command_succeeded` | 控制命令自身是否未产生已知错误；不能单独代表静音成功 |
 | `control_readback` | 控制器是否读回明确状态 |
-| `acoustic_calibration_valid` | 固件、控制器、目标包和 ChatGPT 版本是否仍匹配人工校准 |
+| `acoustic_calibration_valid` | 配置代际、固件、控制器、MicBridge 构建、Android 用户与系统校准结构是否仍匹配人工验证；不绑定第三方应用 |
 | `request_id` | 修改请求中收到的 ID；iPhone 必须核对完全相等 |
 | `haptic_pulses` | 服务端按 1/2/3 规则预先计算的"振动设备"调用次数；它只是把快捷指令原本要做的多重判断折叠成一个整数，客户端仍必须先确认响应 `request_id` 与本次发送值完全相同，不匹配时一律按 3 次处理。 |
 | `replayed` | 是否命中持久幂等账本且没有再次执行副作用 |
@@ -71,8 +75,9 @@ Request ID 是符合上述字符集和长度的 opaque 标识，不要求 RFC UU
 
 配置的 `maxOpenSeconds` 是硬安全窗口，当前两个发布选项都会预留 `min(10 秒, 配置时长的一半)` 作为 Root BLOCK 重试预算。因此默认配置 30 秒时，返回的 `auto_block_at` 通常约为布防起点后 20 秒；Root watcher 从该点开始执行 BLOCK/读回，可持续到 30 秒硬截止后的 60 秒尾窗。其 kernel wake lock 超时在硬截止后另留 90 秒裕量，正常退出时主动释放。不得把 `auto_block_at` 解释成“保证开放满 30 秒”。
 
-发布版仅允许 `audio_manager` 与 `root_sensor_privacy`，两者都在 OPEN 前后只读查询目标 ChatGPT 包的 `RECORD_AUDIO` AppOps。UID override 与 package mode 合成后的有效 mode 为 `ignore`、`deny`、`errored` 时返回 `APPOPS_EXPLICIT_VETO`。`foreground` 的实际许可依赖 UID 当时的进程态，因此它是条件性非显式否决，与 `allow`、`default` 一样只表示这一只读层没有发现硬否决；它不能单独证明 ChatGPT 当前或锁屏/熄屏时可录音，这些状态必须由同一条 Live 会话的解锁、锁屏、熄屏声学校准证明。命令失败、解析不明或无可用 mode 仍映射为 UNKNOWN，并返回 `APPOPS_VETO_UNKNOWN`。该层始终只读，正常 API 路径绝不执行 `appops set`；若 OPEN 后复查出现显式否决/UNKNOWN，会通过所选控制器回滚 BLOCK。上述显式否决、UNKNOWN 或 OPEN 后回滚均以 HTTP 200、`ok=false` 的业务结果返回。
+发布版仅允许 `audio_manager` 与 `root_sensor_privacy`。两者均控制全局 AudioManager 与 Root sensor privacy，OPEN 要求两层均新鲜读回为允许，并通过当前 Android 用户身份、设备校准及 Root 保护检查。正常控制不查询应用 AppOps，不以应用包名、安装状态、版本或录音权限决定系统门能否开放，也不执行 `appops set`。应用权限被拒绝时，系统门仍可为 OPEN，但该应用依然不能录音。
 
+设备校准的结构已更新：旧应用定向记录自动失效。新记录绑定配置代际、控制器、MicBridge 构建、Android Build ID / fingerprint 与当前 Android 用户，不随第三方应用升级而改变。测试应用只用于人工确认系统屏蔽/恢复，不进入授权身份。
 旧开发版保存的 `root_appops` 选择会在加载设置时自动迁移为 `root_sensor_privacy`，不能通过 UI 或 API 再次选择。遗留 lease/开机脚本只把全局 sensor privacy 关闭到 BLOCKED；安全维护流程在全局 BLOCK 新鲜读回后读取并原样保留当前 AppOps 值，再清除旧元数据。它不会根据旧记录恢复、放宽或写入 AppOps。
 
 一次 OPEN 不只检查布防标志：lease 记录应用 PID/starttime 与不可变 boot generation，supervisor 记录并核对自身 PID/starttime，并验证 watcher PID、命令行与状态文件。活动 lease 下 supervisor 约每 200 ms 查轻量状态、约每 1 秒重新发现 user/profile，应用每 250 ms 请求新的 Root 健康证明；空闲 supervisor 以 1 秒周期运行且每轮重新发现 user/profile，发现上下文变化便重新全局 BLOCK/readback。任一活动租约身份、用户上下文、截止时间或进程健康检查失败都会关闭 HTTP 并优先 BLOCK。所有这些行为仍须目标 Root/ROM 真机验证。

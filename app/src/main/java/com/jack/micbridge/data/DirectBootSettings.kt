@@ -15,8 +15,8 @@ class DirectBootSettings(context: Context) {
     val targetPackage: String
         get() = preferences.getString(
             KEY_TARGET_PACKAGE,
-            SettingsRepository.DEFAULT_CHATGPT_PACKAGE,
-        ) ?: SettingsRepository.DEFAULT_CHATGPT_PACKAGE
+            SettingsRepository.GLOBAL_MIC_TARGET,
+        ) ?: SettingsRepository.GLOBAL_MIC_TARGET
 
     val userId: Int
         get() = preferences.getInt(KEY_USER_ID, appUserId())

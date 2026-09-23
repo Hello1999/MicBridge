@@ -14,8 +14,13 @@ import com.jack.micbridge.data.BridgeSnapshot
 import kotlinx.coroutines.delay
 
 @Composable
-fun ControlScreen(snapshot: BridgeSnapshot, onStart: () -> Unit, onBlock: () -> Unit, onConnect: () -> Unit, onCalibrate: () -> Unit, onDiagnose: () -> Unit) {
+fun ControlScreen(
+    snapshot: BridgeSnapshot, runtimePermissionsGranted: Boolean, exactAlarmGranted: Boolean, restorePending: Boolean,
+    onStart: () -> Unit, onBlock: () -> Unit, onRestore: () -> Unit, onConnect: () -> Unit,
+    onCalibrate: () -> Unit, onSettings: () -> Unit, onDiagnose: () -> Unit,
+) {
     val state = presentMic(snapshot)
+    val action = nextControlAction(snapshot, runtimePermissionsGranted, exactAlarmGranted)
     val colors = MaterialTheme.colorScheme
     val statusColors = LocalBridgeStatusColors.current
     val (accent, fill) = when (state.tone) {
@@ -25,56 +30,56 @@ fun ControlScreen(snapshot: BridgeSnapshot, onStart: () -> Unit, onBlock: () -> 
         StatusTone.NEUTRAL -> colors.primary to colors.primaryContainer
     }
     BridgePage {
+        PageIntro("系统麦克风", "统一控制这台设备的麦克风，无需选择应用。")
         Surface(shape = MaterialTheme.shapes.extraLarge, color = colors.surface) {
             Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("麦克风访问", style = MaterialTheme.typography.labelLarge, color = colors.onSurfaceVariant)
-                    Box(Modifier.size(48.dp).background(fill, MaterialTheme.shapes.medium), contentAlignment = Alignment.Center) {
-                        BridgeIcon(state.symbol, Modifier.size(25.dp), accent)
-                    }
+                Box(Modifier.size(56.dp).background(fill, MaterialTheme.shapes.medium), contentAlignment = Alignment.Center) {
+                    BridgeIcon(state.symbol, Modifier.size(28.dp), accent)
                 }
                 Column(Modifier.semantics { liveRegion = LiveRegionMode.Polite }, verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(state.title, style = MaterialTheme.typography.headlineLarge)
                     Text(state.description, style = MaterialTheme.typography.bodyMedium, color = colors.onSurfaceVariant)
                 }
-                SettingDivider()
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    StatusLine("控制读回", if (snapshot.controlReadback) "已确认" else "待确认", snapshot.controlReadback)
-                    StatusLine("声学校准", if (snapshot.acousticCalibrationValid) "有效" else "未完成或已失效", snapshot.acousticCalibrationValid)
-                }
                 snapshot.autoBlockAtEpochMs?.let { LeaseCountdown(it) }
-                if (!snapshot.serviceRunning) {
-                    PrimaryAction("启动服务", symbol = BridgeSymbol.POWER, onClick = onStart)
-                } else {
-                    // BLOCK remains reachable during a transition; a visual busy state must
-                    // never remove the user's emergency blocking action.
-                    PrimaryAction("立即屏蔽", symbol = BridgeSymbol.MIC_OFF, onClick = onBlock)
+                if (snapshot.transitioning) LinearProgressIndicator(Modifier.fillMaxWidth())
+                when (action) {
+                    ControlAction.START -> PrimaryAction("开启麦克风屏蔽", symbol = BridgeSymbol.POWER, onClick = onStart)
+                    // Blocking stays reachable during transitions and unknown states.
+                    ControlAction.BLOCK -> PrimaryAction("立即屏蔽", symbol = BridgeSymbol.MIC_OFF, onClick = onBlock)
+                    ControlAction.PREPARE -> {
+                        PrimaryAction("完成使用设置", symbol = BridgeSymbol.SETTINGS, onClick = onSettings)
+                        Text(
+                            when {
+                                !runtimePermissionsGranted -> "请先允许状态通知，以便随时查看麦克风状态。"
+                                !snapshot.batteryOptimizationExempt -> "请允许持续后台运行，避免保护服务被系统中断。"
+                                else -> "首次设备验证需要允许测试到期自动屏蔽。"
+                            },
+                            style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant,
+                        )
+                    }
+                    ControlAction.VERIFY -> PrimaryAction("验证屏蔽与恢复", symbol = BridgeSymbol.SHIELD, onClick = onCalibrate)
+                    ControlAction.RESTORE -> PrimaryAction(if (restorePending) "正在请求恢复" else "恢复麦克风", enabled = !restorePending, symbol = BridgeSymbol.MIC, onClick = onRestore)
                 }
             }
         }
         if (snapshot.lastError != null && !snapshot.transitioning) {
-            Notice("需要检查", "服务尚有未解决的问题，打开诊断查看原因与处理入口。", error = true, action = "查看诊断", onAction = onDiagnose)
+            if (snapshot.lastError.contains("未获得 Root 权限")) {
+                Notice("需要 Root 授权", "请打开设备的 Root 管理器，允许 MicBridge 使用 Root，然后重新检查。当前还不能确认麦克风已屏蔽。", error = true, action = "已授权，重新检查", onAction = onStart)
+            } else {
+                Notice("有问题需要处理", "打开问题详情，查看原因并重新检查。", error = true, action = "查看问题", onAction = onDiagnose)
+            }
         }
-        SettingsGroup("连接与准备") {
-            SettingRow("iPhone 快捷指令", if (snapshot.serverAddresses.isEmpty()) "尚无可用的局域网请求地址" else "本地服务已监听；iPhone 连通性需实际确认", BridgeSymbol.LINK, onClick = onConnect)
+        SettingsGroup("更多操作") {
+            SettingRow("用 iPhone 遥控", "可选：通过快捷指令切换屏蔽与恢复", BridgeSymbol.LINK, onClick = onConnect)
             SettingDivider()
-            SettingRow("声学校准", if (snapshot.acousticCalibrationValid) "当前环境的校准有效" else "验证屏蔽与恢复收音", BridgeSymbol.SHIELD, onClick = onCalibrate)
+            SettingRow("设备验证", if (snapshot.acousticCalibrationValid) "已完成这台设备的收音测试" else "首次使用时，确认屏蔽与恢复确实有效", BridgeSymbol.SHIELD, onClick = onCalibrate)
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
             BridgeIcon(BridgeSymbol.SHIELD, Modifier.size(14.dp), colors.onSurfaceVariant)
             Spacer(Modifier.width(6.dp))
-            Text("不录音，不保存音频", style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant)
+            Text("MicBridge 不录音，也不保存音频", style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant)
         }
         Spacer(Modifier.height(4.dp))
-    }
-}
-
-@Composable
-private fun StatusLine(label: String, value: String, verified: Boolean) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-        BridgeIcon(if (verified) BridgeSymbol.CHECK else BridgeSymbol.INFO, Modifier.size(16.dp), if (verified) LocalBridgeStatusColors.current.safe else MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
     }
 }
 
@@ -89,7 +94,7 @@ fun LeaseCountdown(deadline: Long) {
     Surface(color = status.attentionContainer, shape = MaterialTheme.shapes.small) {
         Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             BridgeIcon(BridgeSymbol.CLOCK, Modifier.size(18.dp), status.attention)
-            Text(if (seconds > 0) "临时开放剩余 $seconds 秒" else "时限已到，等待屏蔽读回", style = MaterialTheme.typography.labelMedium, color = status.attention)
+            Text(if (seconds > 0) "临时开放剩余 $seconds 秒" else "时间已到，正在确认重新屏蔽", style = MaterialTheme.typography.labelMedium, color = status.attention)
         }
     }
 }

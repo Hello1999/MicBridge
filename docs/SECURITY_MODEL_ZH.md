@@ -2,20 +2,19 @@
 
 > 文档性质：设计约束、威胁边界与剩余风险，不是安全认证或测试通过声明。
 >
-> 当前状态：Android 实现、自动测试和 API 37 模拟器验证已有可执行记录；目标 Root Android 与 iPhone 的真机验证尚未完成。本文件中的“必须”是验收要求，不代表模拟器结果已经满足 Root、锁屏/熄屏、Action Button 或 ChatGPT Live 端到端要求。
+> 当前范围：2026-09-22 起按系统麦克风控制审查。历史构建、模拟器及真机子项不代表本次版本验收。本文件中的“必须”是验收要求；当前检查结果与待验项目见 [系统麦克风审查](SYSTEM_MIC_REVIEW_ZH.md)。
 
 ## 1. 系统与资产
 
 MicBridge 的数据流为：
 
 ```text
-iPhone Action Button
-  → Apple 快捷指令
-  → 当前筛选出的一个或多个私有局域网地址上的 HTTP 请求
+Android 首页按钮 / iPhone Action Button
+  → 本地服务动作 / 可信局域网 HTTP 请求
   → Android MicBridge 前台服务
   → 经校准的麦克风控制器
   → Android 音频/隐私门控
-  → ChatGPT Live 自行采集音频
+  → 已获授权的录音/语音应用自行采集音频
 ```
 
 需要保护的资产包括：
@@ -44,9 +43,9 @@ MVP 的安全目标是：
 - 在不可信或可被监听的共享 Wi-Fi 上提供机密性、响应真实性或抗中间人攻击。
 - bearer token 能证明请求来自某一台物理 iPhone；它只证明请求方持有凭据。
 - 在 Android 被 Settings Force Stop、应用卸载、设备掉电、Root/系统被攻破后，普通 APK 仍能在 30 秒内执行代码。
-- 实时证明 ChatGPT Live 正在运行、当前仍持有录音流或确实收到非静音波形。
+- 实时证明某个录音应用正在运行、持有录音流或收到非静音波形；系统 OPEN 不替代应用录音权限。
 - 覆盖电话尤其是紧急呼叫对麦克风隐私策略的系统级例外。
-- 在未经真机校准的 ROM、固件、profile 或 ChatGPT 版本上可靠工作。
+- 在未经真机验证的 ROM、固件、profile 或 MicBridge 构建上可靠工作。
 
 当前两个发布控制器都会启动独立于 APK 进程的 Root watcher；Action Button 使用无截止时间 watcher，校准/诊断使用短寿命 watcher。默认 `audio_manager` 与 `root_sensor_privacy` 的进程外 fail-safe 都落到全局 sensor privacy BLOCK。lease 绑定应用 PID/starttime 和不可变 generation，常驻 Root supervisor 绑定自己的 PID/starttime，并核对 watcher PID、命令行、状态文件与用户上下文；定时 lease 还核对单调截止时间。活动 OPEN 时 supervisor 约每 200 ms 检查轻量状态，应用另每 250 ms 取得一次新鲜 Root 健康证明；异常即撤销 HTTP、BLOCK/readback 并终止 lease。
 
@@ -58,7 +57,7 @@ MVP 的安全目标是：
 - Android App 私有存储在未 Root 的应用沙箱边界内受信任；设备已 Root 时，其他 Root 进程可以越过该边界。
 - API 36+ 上经 `TetheringManager` 成功监控的专用 Android 热点，其无线加密和强密码是明文 HTTP MVP 的外层机密性边界。
 - 共享 Wi-Fi、VPN、蜂窝接口、USB 网络和任何未知接口均不自动受信任。
-- ChatGPT 是独立应用。MicBridge 只能控制 Android 门控，不能从 ChatGPT 获得可信的会话状态证明。
+- 录音应用是独立应用。MicBridge 只控制 Android 系统门，不改变应用权限，也不从应用取得会话状态证明。控制不依赖第三方应用的安装、包名、版本或 AppOps。
 
 ### 4.2 考虑的攻击者和故障
 
@@ -80,7 +79,7 @@ MVP 的安全目标是：
 
 - Android 创建 WPA2/WPA3 私人热点，使用长且唯一的随机密码。
 - 仅测试/控制用 iPhone 加入；不与访客或其他设备共享密码。
-- Android 同时使用蜂窝网络运行 ChatGPT Live。
+- 需要联网的语音应用可同时使用 Android 蜂窝网络。
 - Android 必须为 API 36+，且 `TetheringManager` 回调成功注册并明确报告下游接口。注册失败、回调不可用或无下游接口时，MicBridge 保持 BLOCKED 且不监听热点地址。
 - 每次热点、系统或固件更新后，重新确认网关地址、客户端互通和熄屏行为。
 
@@ -154,11 +153,11 @@ bearer token 表示“持有者身份”，不表示“这台 iPhone 的硬件�
 - 不监听 `0.0.0.0`。
 - 同一 Wi‑Fi 地址只来自已注册 `ConnectivityManager` 回调中可确认为 Wi‑Fi、非 VPN、未 suspend 的 `Network`。API 36+ 热点地址只来自 `TetheringManager` 回调明确报告的下游接口。两类地址再经 site-local、非 loopback、非 link-local 与接口前缀筛选；`lo`、`rmnet`、`ccmni`、`pdp`、`tun`、`tap`、`wg`、`ipsec`、`dummy` 前缀被排除。
 - ServerSocket 会绑定所有受监控的合格地址与配置端口，不要求地址唯一，也没有用户指定“唯一可信接口”的实现。设备同时存在多个受监控的 Wi‑Fi/热点接口时，API 可能同时暴露在多个 LAN。
-- 没有筛选结果时保持 BLOCKED，拒绝启动远程 OPEN。OPEN 时收到任一网络出现、丢失或链路属性变化回调，会先撤销远程 OPEN 权限、关闭全部旧 listener、串行 BLOCK，再重新枚举和绑定；即使筛选后的 IPv4 集合没有变化，也不会沿用旧 OPEN 权限。
+- 没有筛选结果时不建立远程 listener。启动和网络变化会先确认 BLOCKED，此后仍可在满足核心保护条件时从本机恢复。OPEN 时收到任一网络出现、丢失或链路属性变化回调，会先撤销远程 OPEN 权限、关闭全部旧 listener、串行 BLOCK，再重新枚举和绑定；即使筛选后的 IPv4 集合没有变化，也不会沿用旧 OPEN 权限。
 - 平台回调与接口名前缀过滤仍不是强身份证明。使用者必须关闭不需要的网络接口，逐一核对 UI 的 `addresses`，并用外部探测确认蜂窝/VPN/其他非预期路径不可达。
 - Root 部署可选择增加仅允许选定接口/子网的防火墙规则，但必须有可恢复的卸载与回滚步骤。
 
-若 targetSdk 37 或更高，接受局域网入站 TCP 需要按平台要求声明并请求 `ACCESS_LOCAL_NETWORK`。权限拒绝时服务必须保持 BLOCKED 并报告网络能力不可用。
+若 targetSdk 37 或更高，接受局域网入站 TCP 需要按平台要求声明并请求 `ACCESS_LOCAL_NETWORK`。未授予时不监听远程接口，但不阻止本地麦克风控制。已有远程授权被撤销时先关闭 listener 并 BLOCK；此后持续缺少 LAN 权限不会反复屏蔽合法本地 OPEN。状态通知、当前用户、后台运行与 Root 保护仍独立监督。
 
 ### 8.2 网络丢失语义
 
@@ -234,9 +233,9 @@ Android 是协议的唯一状态来源，但 MicBridge 不是系统麦克风状�
 - toggle 的起点来自同一互斥区内的新鲜读回；UNKNOWN 时只允许尝试 BLOCK，不猜测 OPEN。
 - `previous` 表示本次操作前的观测状态，而不是持久化的“受管理状态”。
 - `verified` 必须绑定读回来源、观测时间、控制器和仍有效的设备校准。
-- OPEN 表示“所有当前可观测、经校准的门控均报告允许”，不表示 MicBridge 实时测得 ChatGPT 的音频波形。
-- BLOCKED 只有在一个经校准、实际有效的屏蔽门控被读回确认后才可报告。
-- 外部状态改变、读回超时、控制器输出不可解析或校准过期时均为 UNKNOWN。
+- OPEN 表示“所有当前可观测、经校准的门控均报告允许”，不表示 MicBridge 实时测得任何应用的音频波形。
+- BLOCKED 表示本次系统控制读回确认了屏蔽；是否已有有效人工设备验证由 `acoustic_calibration_valid` 单独报告。未验证时不宣称声学安全，也不允许正常 OPEN。
+- 读回超时、控制器输出不可解析或系统状态相互冲突时为 UNKNOWN。校准过期使 `verified=false` 并阻止 OPEN，不抹去已取得的 BLOCKED 控制读回。外部状态改变必须重新观测，不沿用缓存。
 
 建议 API/日志另带 `verification_level`、`readback_source`、`observed_at` 和校准版本，避免一个布尔值承载过多含义。
 
@@ -247,7 +246,7 @@ Android 是协议的唯一状态来源，但 MicBridge 不是系统麦克风状�
 Action Button toggle OPEN 的安全顺序是：
 
 1. 在持久请求账本写入 `IN_PROGRESS`，生成不可变 lease ID/控制上下文。
-2. 启动绑定固定 controller/user/target 的无截止时间 Root watcher；`audio_manager` 的 watcher 目标转换为全局 sensor privacy。持续模式不安排到期 Alarm，也不取得定时 kernel wake lock。
+2. 启动绑定固定 controller/user/global target 的无截止时间 Root watcher；`audio_manager` 的 watcher 目标转换为全局 sensor privacy。持续模式不安排到期 Alarm，也不取得定时 kernel wake lock。
 3. 确认 watcher、常驻 supervisor 和应用进程身份健康后才执行 OPEN。
 4. 执行 OPEN 并做新鲜读回；成功后才向 iPhone 返回 OPEN。
 5. OPEN 失败先尝试 BLOCK；只有明确读回 BLOCKED 后才撤销 Alarm/Root lease，无法确认时保留后备。
@@ -258,24 +257,24 @@ Action Button toggle OPEN 的安全顺序是：
 
 已有有效 OPEN 租约时，新的显式 `/open` 只是状态断言：它返回原 `auto_block_at`，不得替换 lease 或延长截止时间。只有状态已经 BLOCKED 后的新 OPEN 才能创建新的租约。
 
-RTC AlarmClock 是 Android 文档中不会被系统调整、且会使系统退出低功耗模式的最强公开调度；第二个单调时钟 Alarm 防止修改墙钟延长租约。ISO 时间只用于 UI。系统可能显示即将到期的闹钟图标。精确闹钟权限、持久化或控制器任一步不可用时，应用不得返回 OPEN。
+RTC AlarmClock 是 Android 文档中不会被系统调整、且会使系统退出低功耗模式的最强公开调度；第二个单调时钟 Alarm 防止修改墙钟延长租约。ISO 时间只用于 UI。系统可能显示即将到期的闹钟图标。临时 OPEN 缺少精确闹钟权限时拒绝开放；持续 toggle 不布防到期 Alarm，也不将该权限作为前提。两种模式中持久化、控制器或必要 Root 监督不可用时都拒绝 OPEN。
 
 ### 12.2 生命周期边界
 
 - `onDestroy()` 和 `onTaskRemoved()` 只能作为额外清理机会，不能作为保证。
 - 正常 UI/通知“停止服务”必须先确认 BLOCKED；失败时保持错误通知并阻止普通停止，另行提供明确警告的人工恢复路径。
-- 进程被系统杀死时依赖 PendingIntent Alarm 和服务重建。
+- 进程被系统杀死时依赖独立 Root 保护；临时 OPEN 另有已布防的 PendingIntent Alarm。服务重建先 BLOCK，不恢复旧 OPEN。
 - Android 13+ Task Manager Stop 不提供应用回调，但系统设计上仍可能执行已安排的 Alarm；必须真机验证。
 - Settings Force Stop 会使应用无法自启动并可能取消 PendingIntent。普通 APK 对此只能披露为剩余风险。
 - 应用卸载、掉电或系统/Root 故障期间，APK 无法执行补救代码。
 
 ### 12.3 Root watchdog 与更严格层级
 
-当前 Debug 实现会部署版本化 `service.d` 开机脚本和常驻 generation supervisor。Action Button 的 watcher 无单调截止时间，保持到 lease 标记被下一次 BLOCK 替换；校准/诊断 watcher 仍按 `/proc/uptime` 截止时间运行并使用带超时的 kernel wake lock。两种 watcher 都固定 controller/user/target，以 `flock` 协调 lease/boot generation，且健康校验失败都拒绝或撤销 OPEN。
+当前 Debug 实现会部署版本化 `service.d` 开机脚本和常驻 generation supervisor。Action Button 的 watcher 无单调截止时间，保持到 lease 标记被下一次 BLOCK 替换；校准/诊断 watcher 仍按 `/proc/uptime` 截止时间运行并使用带超时的 kernel wake lock。两种 watcher 都固定 controller/user/global target，以 `flock` 协调 lease/boot generation，且健康校验失败都拒绝或撤销 OPEN。
 
 supervisor 将应用 PID/starttime、自己的 PID/starttime、不可变 generation 和 watcher PID/命令行/状态纳入活动 lease 健康检查。活动期约 200 ms 检查轻量进程/文件状态，框架 user/profile 发现约每秒一次；应用进程另以 250 ms 周期调用 Root 新鲜核验。任何无法确认都封闭 lease 并 BLOCK，而不是用同一 OPEN 授权静默拉起新 watcher。无活动 lease 时 supervisor 以 1 秒周期运行，且每轮都重新发现 user/profile；发现空闲期上下文变化时先对新全集执行全局 BLOCK/readback，再更新基线。这是实现证据，不是目标设备通过证据；必须对目标 Root 管理器、OEM shell 工具、SELinux、锁屏、Doze、进程 kill 与 Force Stop 逐项实测。
 
-持续监督能缩短已知故障暴露窗口，但不是形式化可用性证明：Root launcher/supervisor 自身仍可能被 Root 管理器、OOM/OEM、SELinux 或信号终止，shell `sleep` 和 sysfs wake lock 的目标内核语义也可能不同。应用仍存活时，250 ms 健康检查会将这类不确定性转为 BLOCK/ERROR；应用同时被 Force Stop 时，只剩独立 Root 层与已布防的 Android exact Alarm。所有 watcher/supervisor 死亡、Force Stop、熄屏和 Doze 场景仍为 `NOT_RUN`，不得因代码中存在 liveness 检查而标为通过。
+持续监督能缩短已知故障暴露窗口，但不是形式化可用性证明：Root launcher/supervisor 自身仍可能被 Root 管理器、OOM/OEM、SELinux 或信号终止，shell `sleep` 和 sysfs wake lock 的目标内核语义也可能不同。应用仍存活时，250 ms 健康检查会将这类不确定性转为 BLOCK/ERROR；应用同时被 Force Stop 时，只能依赖独立 Root 层；临时 OPEN 的 Android Alarm 也可能被 Force Stop 取消。所有 watcher/supervisor 死亡、Force Stop、熄屏和 Doze 场景仍为 `NOT_RUN`，不得因代码中存在 liveness 检查而标为通过。
 
 若 Force Stop 后也要在任意深度休眠下给出形式化的 30 秒保证，还需把当前 shell watcher/supervisor 升级为带 `CLOCK_BOOTTIME_ALARM`/受支持内核唤醒源的独立 Root daemon，并满足：
 
@@ -284,7 +283,7 @@ supervisor 将应用 PID/starttime、自己的 PID/starttime、不可变 generat
 - APK 只能向 watchdog 发放有最大 30 秒的带 lease ID 开放租约。
 - watchdog 自己使用单调时钟，到期独立 BLOCK，并在 APK 死亡或 IPC 中断时保留截止动作。
 - IPC 必须限制为 MicBridge UID/SELinux 上下文或等价本地身份；不得开放任意 Root Shell 字符串执行。
-- 所有控制器命令使用固定参数集合，包名、user ID 等外部值严格验证和转义。
+- 所有控制器命令使用固定参数集合；user ID 与遗留迁移所需包名等外部值严格验证和转义，发布门控的 target 固定为全局。
 - 模块必须提供卸载、升级、失败恢复和手动 BLOCK 文档。
 
 watchdog 仍不能绕过某些 ROM 在锁屏时由 SensorPrivacyService 执行的认证策略；控制器本身仍须先通过 P0。
@@ -304,30 +303,28 @@ watchdog 仍不能绕过某些 ROM 在锁屏时由 SensorPrivacyService 执行�
 
 在 ERROR_UNVERIFIED 中仍可允许认证后的 `/status` 和幂等 `/block` 重试，但必须拒绝 `/open`；`/toggle` 只可执行安全方向的 BLOCK 尝试。
 
-## 14. Root、AppOps 与用户/profile
+## 14. 系统麦克风控制与用户/profile
 
-- 发布 UI 只允许两个选项：默认先测试 `audio_manager`；若失败，再由用户手动测试 `root_sensor_privacy`。运行时不得自动换控制器；`root_appops` 不再是可选、实验或发布控制器。
-- 默认 `audio_manager` 不是单一 AudioManager：实际由 AudioManager 主控、Root sensor privacy gate 与目标 ChatGPT AppOps 只读 veto 组成，只有前两层都为 OPEN 且 AppOps 无显式否决才可能报告 OPEN，所以默认选项需要 Root。其 Root watcher 和开机保护把 `audio_manager` 安全目标映射为全局 sensor privacy BLOCK。
-- `root_sensor_privacy` 选项由 sensor privacy 主控、AudioManager OPEN gate 与同一只读 AppOps veto 组成。两个组合必须独立进行声学校准。
-- 两个发布选项对 AppOps 始终只读不写：UID override 与 package mode 合成后的有效 mode 为 `ignore`、`deny`、`errored` 即显式否决；查询/解析 UNKNOWN 也拒绝 OPEN。`foreground` 依赖 UID 实时进程态，因此只是条件性非显式否决，与 `allow`、`default` 一样只允许继续其他检查。它不能证明 ChatGPT 当前或锁屏/熄屏时可录音，必须由同一条 Live 会话的解锁、锁屏、熄屏声学校准补足证据。该 veto 在主控 OPEN 前后各读一次，后读出现显式否决或 UNKNOWN 则经所选控制器回滚 BLOCK。发布控制和 fail-safe 路径不得执行 `cmd appops set`。
-- 最终选择必须依据同一 ChatGPT Live 会话中解锁亮屏、锁屏亮屏、锁屏熄屏三种状态的 BLOCK 声学结果与 OPEN 后原会话恢复结果；单元测试、模拟器读回和命令退出码均不能替代。
-- 可提交的校准必须在同一服务会话中完成 UI 的三个编号动作与最终提交，形成严格四段边界：带完整租约保护的临时 OPEN → Root-only split（`sensor_privacy=BLOCKED`、`AudioManager=OPEN`、AppOps 已读回为非显式否决 mode（只读且非 UNKNOWN）、Root guard 健康）→ 用户在 split 仍成立时确认无收音，应用新鲜复核后立即完整 BLOCK/清理租约 → 最终安全边界复核后提交。只有前后两个门独立读回为该 split，才能证明 Root fail-safe 不是 AudioManager 的镜像/别名。
-- 校准序列是内存严格状态机。新的临时 OPEN 尝试会先清空旧序列；失败、越序、split 改变、guard/租约失效、最终 BLOCK 或租约清理无法确认都会作废本轮。旧轮 OPEN/隔离/BLOCK 证据不得与新轮拼接，服务重建后也不得复用。
-- Root 扩大了信任边界：其他 Root 进程能读取 token、改变状态和伪造读回，因此“设备已被其他 Root 软件攻破”不在可防御范围内。
-- `cmd sensor_privacy` 的成功退出码不是成功证明；必须使用独立状态读回。
-- 软件 privacy toggle 可能要求设备解锁，Root shell 仍可能被服务策略拒绝。
-- user ID 不得硬编码为 `0`。控制器必须绑定当前 user/profile，并在用户切换后重新校准或进入 UNKNOWN。
-- AppOps 只读结果绑定选定包和当前 user/profile；目标不匹配、输出含糊或任何显式拒绝都 fail closed，且不能替代声学校准。
-- 若设置来自曾支持写 AppOps 的旧开发版，`root_appops` 选择会自动迁移为 `root_sensor_privacy`。旧 lease、watcher 与开机脚本遇到该 ID 时只执行全局 sensor privacy BLOCK，不再写 AppOps。
-- 遗留 AppOps 元数据不能证明当前同值 mode 的最后写入者。安全收尾必须先新鲜确认全局 sensor privacy 为 BLOCKED，再读取并**原样保留**当前 AppOps 值，只清除 MicBridge 的旧元数据/校准；读回或全局屏蔽不可信时保持 HTTP 关闭并拒绝清理。绝不能按旧 ownership 标记恢复或放宽 AppOps。
+- 发布 UI 提供 `audio_manager` 与 `root_sensor_privacy` 两个系统控制方案；运行时不自动切换。`root_appops` 只存在于旧数据迁移，不是可选控制器。
+- 默认 `audio_manager` 使用 AudioManager 主控与 Root sensor privacy 门；`root_sensor_privacy` 使用 sensor privacy 主控与 AudioManager 门。两者都要求系统双读回为 OPEN，且都需要 Root。屏蔽与进程外 fail-safe 的目标是全局 sensor privacy。
+- 正常发布控制不读取目标应用 AppOps，不读取应用包版本，不修改应用权限。旧 `targetPackage` 设置仅保留数据兼容，不参与控制与校准；Direct Boot 镜像使用全局目标。
+- 取消应用 veto 后仍需独立的当前用户守卫。user ID 不得硬编码为 `0`；当前前台用户与服务身份不匹配或无法查询时，拒绝 OPEN 并优先屏蔽。Root supervisor 继续监督已发现 user/profile 的变化。
+- `cmd sensor_privacy` 成功退出码不能证明状态已改变；必须独立读回。某些 ROM 在锁屏时仍会要求认证，Root shell 也可能被系统服务策略拒绝。
+- 两个控制方案分别进行设备验证。人工观察任选有录音权限、能持续录音的应用；先确认其真实可收音，再验证系统 BLOCK 无声及 OPEN 后原会话恢复。解锁亮屏、锁屏亮屏、锁屏熄屏须分别实测，不能从单一应用/单一状态外推所有场景。
+- 可提交的验证在同一服务会话中完成：带完整临时租约保护的 OPEN → Root-only split（`sensor_privacy=BLOCKED`、`AudioManager=OPEN`、Root guard 健康）→ 人工在 split 仍成立时确认无收音，服务新鲜复核并立即完整 BLOCK/清理租约 → 最终安全边界复核后提交。测试应用本身无录音权限或没有活动录音流时，无声不算有效证据。
+- 验证序列是内存严格状态机。新尝试先清空旧证据；失败、越序、split 改变、guard/租约失效、最终 BLOCK 或租约清理无法确认都会作废本轮。旧轮证据不能拼接，服务重建后不能复用。
+- 校准记录绑定配置代际、控制器、MicBridge 构建、Android Build ID / fingerprint 与 Android 用户。新的系统校准结构使旧应用定向记录失效；第三方应用包名、版本与安装状态不再进入身份。
+- Root 扩大信任边界：其他 Root 进程能读取 token、改变状态、伪造读回；设备被其他 Root 软件攻破不在可防御范围内。
+- 旧 `root_appops` 设置迁移为 `root_sensor_privacy`，旧 lease/watch/boot 路径只执行全局 sensor privacy BLOCK。
+- 遗留 AppOps 元数据不能证明当前同值 mode 的最后写入者。维护必须先新鲜确认全局 BLOCKED，再读取并原样保留 AppOps 现值，仅清除旧元数据/校准；失败保持 HTTP 关闭。不得恢复、放宽或写入 AppOps。这一迁移收尾不是当前麦克风控制的应用权限门。
 
 ## 15. 前台服务与用户可见性
 
 - 服务应使用符合实际网络设备交互用途的前台服务类型，并满足目标 SDK 的权限前提。
 - `startForeground()` 必须先于可能耗时的 Root BLOCK；初始通知显示 `正在确认安全状态/UNKNOWN`，而不是虚假 BLOCKED。
 - HTTP 端口只在 BLOCKED 已验证后开放。
-- Android 13+ 若通知权限被拒，前台服务通知可能不在通知抽屉显示。产品若把常驻状态通知视为安全要求，应在权限缺失时拒绝远程 OPEN。
-- “可靠模式”默认开启：前台服务启动后取得最长 1 小时的 Partial WakeLock，并每 45 分钟释放后重新取得一次。因此单次锁虽有界，服务长期运行时实际接近连续持有，而非只在 OPEN 租约期间持有；这会增加耗电。关闭后后台可靠性变化、以及设置需重启服务才影响当前持锁状态，都必须纳入真机测试。
+- Android 13+ 若通知权限被拒，前台服务通知可能不在通知抽屉显示。当前实现将可见状态通知作为核心保护条件：权限缺失、通知关闭或通知渠道禁用时，本地与远程 OPEN 都拒绝。
+- “保持后台运行”（可靠模式）默认开启：前台服务启动后取得最长 1 小时的 Partial WakeLock，并每 45 分钟释放后重新取得一次。因此单次锁虽有界，服务长期运行时实际接近连续持有，而非只在 OPEN 租约期间持有；这会增加耗电。关闭后后台可靠性变化、以及设置需重启服务才影响当前持锁状态，都必须纳入真机测试。
 - OEM 后台限制和电池策略属于必须真机测试的运行条件，不得仅凭 `START_STICKY` 宣称可靠。
 
 ## 16. 日志、隐私与备份
@@ -342,7 +339,7 @@ MicBridge 不申请生产 `RECORD_AUDIO`，不打开 AudioRecord，不存储或�
 
 SQLite 最多保留 100 条，应用 UI 只展示最近 20 条；当前没有应用内日志导出功能。真机证据必须使用 UI 截图，或在明确授权的 ADB/Root 流程中提取应用数据库与对应 `logcat`/`dumpsys`，不能在测试计划中虚构“导出”按钮或导出文件。
 
-不得记录 token、完整请求头、Root 命令中的敏感值、热点密码、完整私人 IP、ChatGPT 对话或音频。token、Root 配置和审计日志应通过数据提取规则排除云备份；崩溃报告发送前同样脱敏。
+不得记录 token、完整请求头、Root 命令中的敏感值、热点密码、完整私人 IP、应用对话或音频。token、Root 配置和审计日志应通过数据提取规则排除云备份；崩溃报告发送前同样脱敏。
 
 ## 17. 威胁与缓解摘要
 
@@ -353,10 +350,10 @@ SQLite 最多保留 100 条，应用 UI 只展示最近 20 条；当前没有应
 | 伪造成功响应 | 可信专用链路；未来 TLS/HMAC | 当前 HTTP 无响应真实性保证 |
 | 慢连接耗尽服务 | 3 秒读取超时、大小限制、并发上限 4 | 无按来源/认证失败限速，同网攻击者仍可造成 DoS |
 | 外部改变麦克风状态 | 每次操作前后新鲜读回、UNKNOWN 策略 | 响应后仍可能立即被外部改变 |
-| OPEN 后 APK 崩溃 | RTC AlarmClock + 单调 exact Alarm；两个发布选项另加 Root watcher 与常驻 supervisor | supervisor/Root 工具/SELinux 的真实存活和调度仍须目标 Root 实测 |
+| OPEN 后 APK 崩溃 | 持续 OPEN 使用 Root watcher 与 supervisor；临时 OPEN 另加 RTC AlarmClock + 单调 exact Alarm | supervisor/Root 工具/SELinux 的真实存活和调度仍须目标 Root 实测 |
 | Force Stop 后维持 OPEN | watcher + PID/starttime 绑定的 supervisor；活动时约 200 ms Root 监督及 250 ms 应用内健康检查 | 应用检查会随进程停止，独立 Root 层仍需真机证明；不能声称形式化保证 |
 | Root Shell 返回 0 但未执行 | 独立 readback、锁屏 P0 | 无稳定读回的 ROM 不支持 |
-| 遗留 AppOps 被错误放宽 | 发布控制始终只读；旧选择迁移为 sensor privacy；全局 BLOCK 后保留当前值并只清元数据 | 升级路径与 OEM AppOps 输出仍须真机验证；不提供自动恢复原 mode |
+| 遗留 AppOps 被错误放宽 | 发布控制不使用 AppOps；旧选择迁移为 sensor privacy；维护全局 BLOCK 后保留当前值并只清元数据 | 升级路径与 OEM AppOps 输出仍须真机验证；不提供自动恢复原 mode |
 | 监听到错误接口 | 不绑定通配地址；同一 Wi‑Fi 来自 ConnectivityManager；API 36+ 热点来自 TetheringManager；网络变化先 BLOCK | 会绑定全部受监控的合格地址，平台分类仍需真机审计，IP 变化需重配 Shortcut |
 | token 从备份/剪贴板泄露 | 排除备份、敏感剪贴板、轮换 | Root/物理解锁者仍可获取 |
 
@@ -369,10 +366,10 @@ SQLite 最多保留 100 条，应用 UI 只展示最近 20 条；当前没有应
 - 未认证请求不能读取状态或触发任何控制器调用。
 - 相同 request ID 在并发、响应丢失、服务重启和崩溃恢复后不会产生第二次 toggle。
 - 所有成功响应都有本次新鲜读回；退出码、缓存或上次状态不能单独产生成功。
-- OPEN 前 lease 与后备定时已经布防；30 秒、进程 kill 和 Task Manager Stop 均按真机计划验证。
+- 所有 OPEN 前均已布防 Root lease；临时 OPEN 另需双 Alarm 与有限 wake lock。持续与临时模式的进程 kill、Task Manager Stop 和临时截止分别真机验证。
 - Force Stop 按实际交付层级标为已知限制或由独立 watchdog 真机通过，不能用普通进程 kill 的结果替代。
 - 与交付 Android API 级别相符的网络路径必须分别记录：API 31–35 同一可信 Wi‑Fi；API 36+ 再增加 `TetheringManager` 监控成功的专用 Android 私人热点；同时验证 iPhone 锁屏路径。
-- Root 控制组合、AppOps 只读目标、当前 user/profile、固件与 ChatGPT 版本均进入校准记录。
+- 配置代际、Root 控制组合、当前 Android 用户、固件与 MicBridge 构建均进入系统校准记录，旧结构不得复用。
 - 所有未执行或失败项目继续显示为 `NOT_RUN`、`FAIL`、`BLOCKED` 或 `NOT_SUPPORTED`。
 
 ## 19. 事件响应与人工恢复
@@ -383,7 +380,7 @@ SQLite 最多保留 100 条，应用 UI 只展示最近 20 条；当前没有应
 2. 停止 MicBridge 服务并关闭热点，避免继续接受远程请求。
 3. 保存脱敏诊断证据。
 4. 轮换 token；若使用共享 Wi-Fi，必要时同时更换热点密码。
-5. 检查 Root 授权、当前 user/profile、控制器读回和 ChatGPT 版本。
+5. 检查 Root 授权、当前 user/profile、系统控制读回与 MicBridge / Android 构建身份。
 6. 重新执行 P0 校准后才恢复远程 OPEN。
 
 任何时候都不得用“一般应该已经静音”代替可验证的 BLOCKED 状态。

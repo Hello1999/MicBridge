@@ -1,5 +1,7 @@
 # MicBridge 真机测试计划
 
+> 历史记录：本文对应 2026-09-04 前后使用应用定向校准的旧实现。下文“当前/最终/本轮”和 PASS 均限于当时版本，不是 2026-09-22 系统麦克风改动的验收。ChatGPT/AppOps 项保留作历史证据；新版范围与待验清单见 [系统麦克风审查](SYSTEM_MIC_REVIEW_ZH.md)。
+
 > 文档性质：测试计划与验收模板，不是测试结果。
 >
 > 当前双机 P0 与端到端状态：`NOT_RUN`。Motorola 真机部署、两次 Root boot guard 重启检查、最终 OEM 自然开机启动，以及 iPhone 快捷指令静态结构/iCloud 同步已有本轮 `PASS` 证据，但这些子项不能替代 ChatGPT Live 声学、锁屏/熄屏、Doze、Action Button、触感或故障注入。只有对应条目在目标 Android 与 iPhone 上实际执行并保存证据后，才可分别改为 `PASS`。

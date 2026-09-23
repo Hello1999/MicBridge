@@ -23,60 +23,52 @@ fun SettingsScreen(
     snapshot: BridgeSnapshot, values: SettingsValues, runtimePermissionsGranted: Boolean, exactAlarmGranted: Boolean,
     onStart: () -> Unit, onStop: () -> Unit, onAutoStart: (Boolean) -> Unit, onReliable: (Boolean) -> Unit,
     onPermissions: () -> Unit, onExactAlarm: () -> Unit, onBattery: () -> Unit, onAppSettings: () -> Unit,
-    onInstallGuard: () -> Unit, onRemoveGuard: () -> Unit, onCalibrate: () -> Unit, onDiagnostics: () -> Unit, onAdvanced: () -> Unit,
+    onCalibrate: () -> Unit, onDiagnostics: () -> Unit, onAdvanced: () -> Unit,
 ) {
     BridgePage {
-        PageIntro("设置", "配置后台运行，管理设备校准与保护。")
+        PageIntro("设置", "完成设备准备，让麦克风控制在后台保持可用。")
+        SettingsGroup("使用前准备") {
+            SettingRow("状态通知", if (runtimePermissionsGranted) "已允许" else "待设置：在通知栏显示麦克风状态", value = if (runtimePermissionsGranted) null else "去设置", onClick = onPermissions)
+            SettingDivider()
+            SettingRow("测试结束自动屏蔽", if (exactAlarmGranted) "已允许" else "待设置：允许“闹钟和提醒”权限", value = if (exactAlarmGranted) null else "去设置", onClick = onExactAlarm)
+            SettingDivider()
+            SettingRow("允许持续后台运行", if (snapshot.batteryOptimizationExempt) "已确认" else "待设置：将 MicBridge 设为不受电池优化限制", value = if (snapshot.batteryOptimizationExempt) null else "去设置", onClick = onBattery)
+        }
         SettingsGroup("后台运行") {
-            SettingRow("桥接服务", if (snapshot.serviceRunning) "运行中；停止前会先确认屏蔽" else "已停止", BridgeSymbol.POWER)
-            SecondaryAction(if (snapshot.serviceRunning) "屏蔽后停止服务" else "启动服务", onClick = if (snapshot.serviceRunning) onStop else onStart)
+            SettingRow("麦克风保护服务", if (snapshot.serviceRunning) "运行中" else "已停止", BridgeSymbol.POWER)
+            SecondaryAction(if (snapshot.serviceRunning) "屏蔽并停止服务" else "开启麦克风屏蔽", onClick = if (snapshot.serviceRunning) onStop else onStart)
             Spacer(Modifier.height(12.dp)); SettingDivider()
-            ToggleSetting("开机自动启动", "设备启动后恢复桥接服务", values.autoStart, onCheckedChange = onAutoStart)
+            ToggleSetting("开机自动启动", "设备启动后自动开启麦克风保护", values.autoStart, onCheckedChange = onAutoStart)
             SettingDivider()
-            ToggleSetting("保持后台可靠运行", if (snapshot.serviceRunning) "需先停止服务，再修改此项" else "保持 CPU 唤醒，提高后台运行可靠性", values.reliableMode, !snapshot.serviceRunning, onReliable)
+            ToggleSetting("保持后台运行", if (snapshot.serviceRunning) "停止服务后可修改" else "减少休眠中断，可能增加耗电", values.reliableMode, !snapshot.serviceRunning, onReliable)
+            SettingDivider()
+            SettingRow("应用系统设置", "管理自启动、电池和其他系统权限", onClick = onAppSettings)
         }
-        SettingsGroup("运行权限") {
-            SettingRow("通知与运行权限", if (runtimePermissionsGranted) "已允许" else "尚未完整授予", onClick = onPermissions)
+        SettingsGroup("验证与帮助") {
+            SettingRow("设备验证", if (snapshot.acousticCalibrationValid) "已通过屏蔽与恢复测试" else "首次使用前测试实际收音效果", BridgeSymbol.SHIELD, onClick = onCalibrate)
             SettingDivider()
-            SettingRow("精确安全闹钟", if (exactAlarmGranted) "已允许" else "需允许，用于临时开放到期屏蔽", onClick = onExactAlarm)
+            SettingRow("问题与操作记录", "查看失败原因，重新检查当前状态", BridgeSymbol.INFO, onClick = onDiagnostics)
             SettingDivider()
-            SettingRow("电池优化豁免", if (snapshot.batteryOptimizationExempt) "已确认" else "尚未确认，远程开放不可用", onClick = onBattery)
-            SettingDivider()
-            SettingRow("系统后台设置", "在厂商设置中允许后台运行；ChatGPT 需启用后台对话", onClick = onAppSettings)
-        }
-        SettingsGroup("Root 开机保护") {
-            SettingRow(if (values.guardInstalled) "保护脚本已部署" else "尚未部署保护脚本", "实际重启后的屏蔽效果需真机确认", BridgeSymbol.SHIELD)
-            SecondaryAction(if (values.guardInstalled) "刷新开机保护" else "安装开机保护", snapshot.serviceRunning && values.controllerId in setOf(SettingsRepository.CONTROLLER_AUDIO_MANAGER, SettingsRepository.CONTROLLER_SENSOR_PRIVACY), onInstallGuard)
-            Spacer(Modifier.height(8.dp))
-            TextButton(onRemoveGuard, enabled = values.guardInstalled || values.pendingLegacyState, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("安全移除保护并停止") }
-            Spacer(Modifier.height(6.dp))
-        }
-        SettingsGroup("校准与维护") {
-            SettingRow("声学校准", if (snapshot.acousticCalibrationValid) "当前环境有效" else "验证实际屏蔽与恢复收音", BridgeSymbol.MIC, onClick = onCalibrate)
-            SettingDivider()
-            SettingRow("诊断与记录", "控制器读回、错误与最近操作", BridgeSymbol.INFO, onClick = onDiagnostics)
-            SettingDivider()
-            SettingRow("高级控制", "控制方案、目标应用、临时开放时限", BridgeSymbol.CONTROL, onClick = onAdvanced)
+            SettingRow("高级维护", "控制方案、开机保护和测试时限", BridgeSymbol.CONTROL, onClick = onAdvanced)
         }
     }
 }
 
 @Composable
 fun AdvancedScreen(
-    snapshot: BridgeSnapshot, values: SettingsValues, packageInput: String, secondsInput: String,
-    onController: (String) -> Unit, onPackageChange: (String) -> Unit, onSavePackage: () -> Unit,
-    onSecondsChange: (String) -> Unit, onSaveSeconds: () -> Unit, onMaintenance: () -> Unit,
+    snapshot: BridgeSnapshot, values: SettingsValues, secondsInput: String,
+    onController: (String) -> Unit, onSecondsChange: (String) -> Unit, onSaveSeconds: () -> Unit,
+    onMaintenance: () -> Unit, onInstallGuard: () -> Unit, onRemoveGuard: () -> Unit,
 ) {
     val controllerEditable = !snapshot.serviceRunning && !values.guardInstalled && !values.pendingLegacyState
-    val validPackage = PackagePattern.matches(packageInput)
     val validSeconds = secondsInput.toIntOrNull()?.let { it in SettingsRepository.MIN_OPEN_SECONDS..SettingsRepository.MAX_OPEN_SECONDS } == true
     BridgePage {
-        if (!controllerEditable) Notice("控制设置已锁定", "更换控制方案或目标应用前，需完整屏蔽、移除开机保护并完成安全退出。", action = "前往安全维护", onAction = onMaintenance)
-        Notice("影响系统麦克风访问", "系统级麦克风控制也会影响电话、相机和其他应用。紧急呼叫行为不在保证范围内。")
-        SettingsGroup("控制方案") {
+        PageIntro("高级维护", "通常无需更改。仅在设备不兼容或排查问题时使用。")
+        if (!controllerEditable) Notice("控制方案暂不可更改", "更换前请先停止服务；若已安装开机保护，请先移除保护。", action = "返回设置", onAction = onMaintenance)
+        SettingsGroup("系统麦克风控制方案") {
             listOf(
-                Triple(SettingsRepository.CONTROLLER_AUDIO_MANAGER, "标准方案", "首选 · AudioManager 主控，需要 Root"),
-                Triple(SettingsRepository.CONTROLLER_SENSOR_PRIVACY, "Root 方案", "标准方案真机测试失败后，再手动选择"),
+                Triple(SettingsRepository.CONTROLLER_AUDIO_MANAGER, "标准方案", "系统静音与 Root 保护协同控制，建议使用"),
+                Triple(SettingsRepository.CONTROLLER_SENSOR_PRIVACY, "兼容方案", "直接使用系统麦克风隐私开关，标准方案不适用时选择"),
             ).forEachIndexed { index, (id, title, description) ->
                 if (index > 0) SettingDivider()
                 Row(Modifier.fillMaxWidth().selectable(values.controllerId == id, enabled = controllerEditable, role = Role.RadioButton, onClick = { onController(id) }).padding(vertical = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -88,22 +80,21 @@ fun AdvancedScreen(
                 }
             }
         }
-        SettingsGroup("目标应用") {
-            Column(Modifier.padding(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(packageInput, onPackageChange, label = { Text("ChatGPT Android 包名") }, enabled = controllerEditable, singleLine = true, modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii), isError = !validPackage, shape = MaterialTheme.shapes.small, supportingText = { Text(if (validPackage) "保存后需要重新校准" else "请输入完整的应用包名") })
-                SecondaryAction("保存目标应用", controllerEditable && validPackage, onSavePackage)
-            }
+        SettingsGroup("Root 开机保护") {
+            SettingRow(if (values.guardInstalled) "已安装开机保护" else "未安装开机保护", "在应用启动前尝试屏蔽麦克风，安装后需实际重启验证。", BridgeSymbol.SHIELD)
+            SecondaryAction(if (values.guardInstalled) "重新安装开机保护" else "安装开机保护", snapshot.serviceRunning && values.controllerId in setOf(SettingsRepository.CONTROLLER_AUDIO_MANAGER, SettingsRepository.CONTROLLER_SENSOR_PRIVACY), onInstallGuard)
+            Spacer(Modifier.height(8.dp))
+            TextButton(onRemoveGuard, enabled = values.guardInstalled || values.pendingLegacyState, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("移除保护并停止服务") }
+            Spacer(Modifier.height(6.dp))
         }
-        SettingsGroup("校准临时开放时限") {
+        SettingsGroup("测试开放时限") {
             Column(Modifier.padding(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(secondsInput, onSecondsChange, label = { Text("最长开放秒数") }, enabled = !snapshot.serviceRunning, singleLine = true, modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), isError = !validSeconds, shape = MaterialTheme.shapes.small, supportingText = { Text(if (snapshot.serviceRunning) "需先停止服务，再修改时限" else "5–30 秒") })
+                OutlinedTextField(secondsInput, onSecondsChange, label = { Text("最长开放秒数") }, enabled = !snapshot.serviceRunning, singleLine = true, modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), isError = !validSeconds, shape = MaterialTheme.shapes.small, supportingText = { Text(if (snapshot.serviceRunning) "停止服务后可修改" else "5–30 秒") })
                 SecondaryAction("保存时限", !snapshot.serviceRunning && validSeconds, onSaveSeconds)
-                Text("仅用于声学校准和诊断开放。iPhone 快捷指令采用持续开放，再次按下才会屏蔽。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("仅用于设备验证。日常恢复后会保持开放，直到再次屏蔽；服务异常时会尝试自动屏蔽。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-        Notice("控制与验证机制", "两个方案都包含系统门控与 ChatGPT AppOps 的只读检查，运行时不会自动更换方案。开放还需满足精确闹钟、Root 监督器等服务端条件。")
-        if (values.pendingLegacyState) Notice("检测到旧版遗留配置", "安全维护会先确认全局屏蔽，保留当前 AppOps 策略并清理旧元数据，不会自动放宽外部权限。", error = true)
+        Text("两种方案均需要 Root，影响这台设备上的麦克风使用。系统对通话等特殊场景可能另有处理，需在实际设备上验证。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (values.pendingLegacyState) Notice("需要清理旧版配置", "请使用“移除保护并停止服务”完成迁移。已有的应用麦克风权限会保留。", error = true)
     }
 }
-
-val PackagePattern = Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)+")

@@ -8,6 +8,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.setValue
 import com.jack.micbridge.service.BridgeForegroundService
+import com.jack.micbridge.service.ServiceRuntime
 import com.jack.micbridge.ui.MicBridgeApp
 import com.jack.micbridge.ui.MicBridgeTheme
 
@@ -23,8 +24,14 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         resumeGeneration++
-        // Returning from system settings remains a trust boundary: start first blocks,
-        // verifies the controller and only then restores a fresh listener generation.
-        BridgeForegroundService.start(this)
+        // Returning from a recording app or unlocking must not restart the control flow:
+        // ACTION_START deliberately blocks, so it would interrupt both normal use and
+        // the ongoing microphone verification. The service monitors permission/network
+        // boundaries itself; only a stopped service needs a new startup here.
+        if (!ServiceRuntime.snapshot.value.serviceRunning) {
+            BridgeForegroundService.start(this)
+        } else {
+            BridgeForegroundService.start(this, BridgeForegroundService.ACTION_REFRESH_STATE)
+        }
     }
 }

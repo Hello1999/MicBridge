@@ -98,9 +98,9 @@ class CalibrationSessionTest {
     }
 
     @Test
-    fun `target update between any steps invalidates the whole round`() {
-        val original = identity(targetVersion = "1.0:100")
-        val updated = identity(targetVersion = "1.1:101")
+    fun `system update between any steps invalidates the whole round`() {
+        val original = identity(androidBuild = "android-build-1")
+        val updated = identity(androidBuild = "android-build-2")
         val session = CalibrationSession()
 
         session.beginOpenAttempt(original)
@@ -112,9 +112,9 @@ class CalibrationSessionTest {
     }
 
     @Test
-    fun `submission never returns a newly observed package version as tested`() {
-        val tested = identity(targetVersion = "1.0:100")
-        val replacement = identity(targetVersion = "1.1:101")
+    fun `submission never returns a newly observed system version as tested`() {
+        val tested = identity(androidBuild = "android-build-1")
+        val replacement = identity(androidBuild = "android-build-2")
         val session = CalibrationSession()
         completeRound(session, tested)
 
@@ -125,13 +125,10 @@ class CalibrationSessionTest {
     }
 
     @Test
-    fun `same-version reinstall and controller or system changes invalidate the round`() {
+    fun `controller app build and system changes invalidate the round`() {
         val original = identity()
         val changes = listOf(
             original.copy(settingsGeneration = original.settingsGeneration + 1L),
-            original.copy(targetPackageUid = original.targetPackageUid + 1),
-            original.copy(targetPackageLastUpdateTimeEpochMs = 2_000L),
-            original.copy(targetSigningCertificateSha256 = "bb"),
             original.copy(controllerId = "audio_manager"),
             original.copy(micBridgeBuildId = "new-build"),
             original.copy(androidBuildId = "new-android-build"),
@@ -167,16 +164,11 @@ class CalibrationSessionTest {
         session.observeIsolationConfirmationAndBlock(identity, verified = true)
     }
 
-    private fun identity(targetVersion: String = "1.0:100") = AcousticCalibrationIdentity(
+    private fun identity(androidBuild: String = "android-build") = AcousticCalibrationIdentity(
         settingsGeneration = 1L,
         controllerId = "fake",
-        targetPackage = "com.openai.chatgpt",
-        targetPackageVersion = targetVersion,
-        targetPackageUid = 10123,
-        targetPackageLastUpdateTimeEpochMs = 1_000L,
-        targetSigningCertificateSha256 = "aa",
         micBridgeBuildId = "micbridge-build",
-        androidBuildId = "android-build",
+        androidBuildId = androidBuild,
         androidFingerprint = "vendor/device/build",
         androidUserId = 0,
     )

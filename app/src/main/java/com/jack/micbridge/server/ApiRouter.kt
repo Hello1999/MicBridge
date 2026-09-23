@@ -115,7 +115,7 @@ class ApiRouter(
             if (verified) null else "STATE_UNVERIFIED",
             snapshot.lastError ?: when {
                 !snapshot.controlReadback -> "当前麦克风控制状态无法确认"
-                !snapshot.acousticCalibrationValid -> "当前固件、控制器与 ChatGPT 版本尚未通过声学校准"
+                !snapshot.acousticCalibrationValid -> "当前系统与控制方式尚未完成收音验证"
                 else -> "当前状态未满足完整验证条件"
             },
         ),

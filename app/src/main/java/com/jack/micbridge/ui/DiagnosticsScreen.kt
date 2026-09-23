@@ -18,10 +18,10 @@ private val AuditTime = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss").withZone(Z
 @Composable
 fun DiagnosticsScreen(snapshot: BridgeSnapshot, records: List<AuditEntry>?, onRefresh: () -> Unit) {
     BridgePage {
-        PageIntro("诊断与记录", "查看控制读回和最近操作，定位服务问题。")
+        PageIntro("问题与操作记录", "查看失败原因和最近操作，排查设备兼容性。")
         SettingsGroup("当前状态") {
             DetailText("控制读回", if (snapshot.controlReadback) "已确认" else "未确认")
-            SettingDivider(); DetailText("声学校准", if (snapshot.acousticCalibrationValid) "有效" else "未完成或已失效")
+            SettingDivider(); DetailText("设备验证", if (snapshot.acousticCalibrationValid) "有效" else "未完成或已失效")
             SettingDivider(); DetailText("控制器", snapshot.controllerId)
             SettingDivider(); DetailText("自动探测", snapshot.controllerProbe ?: "尚未完成")
             SettingDivider(); DetailText("安全闹钟 / Root 监督器", "${snapshot.leaseExactAlarmArmed.asReadiness()} / ${snapshot.leaseRootWatchdogArmed.asReadiness()}")

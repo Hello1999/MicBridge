@@ -26,6 +26,7 @@ class MicCoordinator(
     private val calibrationValid: () -> Boolean,
     private val persistentRemoteOpen: () -> Boolean = { false },
     private val openAllowed: () -> Boolean = { true },
+    private val normalOpenAllowed: () -> Boolean = { true },
     private val remoteOpenAllowed: (Long) -> Boolean = { true },
     private val nowEpochMs: () -> Long = System::currentTimeMillis,
     private val elapsedRealtimeMs: () -> Long = nowEpochMs,
@@ -183,6 +184,27 @@ class MicCoordinator(
             )
         }
 
+    /** Local UI control uses the same guarded transition as HTTP, without depending on an HTTP listener generation. */
+    suspend fun localToggle(): OperationResult = mutex.withLock {
+        val previous = controller.readState(activeLeaseTarget)
+        val target = if (previous == MicAccessState.BLOCKED) {
+            MicAccessState.OPEN
+        } else {
+            MicAccessState.BLOCKED
+        }
+        record(
+            "local-toggle",
+            transition(
+                previous = previous,
+                target = target,
+                requestId = "local-${UUID.randomUUID()}",
+                requireCalibration = true,
+                remoteGeneration = null,
+                persistentOpen = target == MicAccessState.OPEN && persistentRemoteOpen(),
+            ),
+        )
+    }
+
     suspend fun calibrationOpen(): OperationResult = mutex.withLock {
         // A freshly initialized BLOCKED coordinator already owns a verified observation. The
         // guarded OPEN transition will block and verify again before arming its fail-safe lease,
@@ -218,7 +240,7 @@ class MicCoordinator(
     suspend fun calibrationIsolateRootFailsafe(
         rootGate: MicController,
         audioGate: MicController,
-        appOpsVeto: ReadOnlyOpenVeto,
+        targetUserIsForeground: (Int) -> Boolean,
         immediateRootBlock: suspend () -> Boolean = { true },
     ): ControlResult = mutex.withLock {
         val requestId = activeLeaseRequestId
@@ -283,11 +305,11 @@ class MicCoordinator(
                         "隔离校准开始前安全租约已到期",
                     )
                 }
-                if (appOpsVeto.readState(leaseTarget) != MicAccessState.OPEN) {
+                if (!targetUserIsForeground(leaseTarget.userId)) {
                     return@withMutationLock controlFailure(
                         MicAccessState.BLOCKED,
-                        "CALIBRATION_APPOPS_NOT_OPEN",
-                        "ChatGPT RECORD_AUDIO AppOps 不是可确认的允许状态",
+                        "CALIBRATION_USER_CHANGED",
+                        "校准用户已切换或当前 Android 用户无法确认",
                     )
                 }
                 val rootBlocked = rootGate.block(rootTarget)
@@ -309,13 +331,12 @@ class MicCoordinator(
                 )
                 val rootFresh = rootGate.readState(rootTarget)
                 val audioFresh = audioGate.readState(audioTarget)
-                val appOpsFresh = appOpsVeto.readState(leaseTarget)
                 val verified =
                     audioOpened.controlReadback &&
                         audioOpened.observed == MicAccessState.OPEN &&
                         rootFresh == MicAccessState.BLOCKED &&
                         audioFresh == MicAccessState.OPEN &&
-                        appOpsFresh == MicAccessState.OPEN &&
+                        targetUserIsForeground(leaseTarget.userId) &&
                         hasValidActiveLease()
                 ControlResult(
                     requested = MicAccessState.BLOCKED,
@@ -325,7 +346,7 @@ class MicCoordinator(
                     errorCode = if (verified) null else "CALIBRATION_ROOT_NOT_ISOLATED",
                     errorMessage = if (verified) null else listOfNotNull(
                         audioOpened.errorMessage,
-                        "无法同时确认 Root sensor_privacy=BLOCKED、AudioManager=OPEN 且 AppOps=允许",
+                        "无法同时确认系统隐私开关已屏蔽、音频层已开放且用户未切换",
                     ).joinToString("；"),
                 )
             }
@@ -358,7 +379,7 @@ class MicCoordinator(
                     serviceRunning = true,
                     addresses = emptyList(),
                     latency = isolated.durationMs,
-                    error = "隔离校准模式：请确认 ChatGPT 已听不到声音，然后立即确认并完整屏蔽",
+                    error = "隔离校准模式：请确认录音应用已收不到声音，然后立即确认并完整屏蔽",
                     calibrationOverride = false,
                 ),
             )
@@ -376,7 +397,7 @@ class MicCoordinator(
     suspend fun confirmRootIsolationAndBlock(
         rootGate: MicController,
         audioGate: MicController,
-        appOpsVeto: ReadOnlyOpenVeto,
+        targetUserIsForeground: (Int) -> Boolean,
     ): ControlResult = mutex.withLock {
         val leaseTarget = activeLeaseTarget
         val rootTarget = rootGate.captureSafetyTarget()
@@ -389,14 +410,14 @@ class MicCoordinator(
                 hasHealthyActiveLease() &&
                 rootGate.readState(rootTarget) == MicAccessState.BLOCKED &&
                 audioGate.readState(audioTarget) == MicAccessState.OPEN &&
-                appOpsVeto.readState(leaseTarget) == MicAccessState.OPEN
+                targetUserIsForeground(leaseTarget.userId)
         } catch (_: Throwable) {
             false
         }
         if (!splitVerified) {
             return@withLock failCalibrationIsolation(
                 "CALIBRATION_ISOLATION_NOT_CURRENT",
-                "确认时 Root-only 隔离状态、AppOps 或监督器已变化；本轮证据作废",
+                "确认时系统隔离状态、Android 用户或监督器已变化；本轮证据作废",
             )
         }
 
@@ -442,6 +463,9 @@ class MicCoordinator(
         remoteGeneration: Long?,
         persistentOpen: Boolean,
     ): OperationResult {
+        // A queued calibration action must revoke normal local OPEN just as it revokes HTTP
+        // OPEN, while the calibration sequence itself retains its guarded temporary path.
+        fun openingAllowed() = openAllowed() && (!requireCalibration || normalOpenAllowed())
         calibrationIsolationActive = false
         state = BridgeMicState.Transitioning(previous, target)
         onSnapshot(
@@ -452,7 +476,7 @@ class MicCoordinator(
                 addresses = emptyList(),
             ),
         )
-        val lifecycleAllowedAtEntry = target != MicAccessState.OPEN || openAllowed()
+        val lifecycleAllowedAtEntry = target != MicAccessState.OPEN || openingAllowed()
         if (!lifecycleAllowedAtEntry) {
             return failedOpen(
                 previous,
@@ -470,7 +494,7 @@ class MicCoordinator(
                 requestId = requestId,
                 forcedOk = false,
                 overrideCode = "ACOUSTIC_CALIBRATION_REQUIRED",
-                overrideMessage = "当前固件、控制器与 ChatGPT 版本尚未通过声学校准",
+                overrideMessage = "当前系统与控制方式尚未完成收音验证",
             )
         }
 
@@ -479,12 +503,12 @@ class MicCoordinator(
         // crash window with no independent watcher, and repeated calls could extend the
         // nominal 30-second maximum indefinitely.
         if (target == MicAccessState.OPEN && previous == MicAccessState.OPEN) {
-            val lifecycleStillAllowedBeforeRead = openAllowed()
+            val lifecycleStillAllowedBeforeRead = openingAllowed()
             val generationStillAllowedBeforeRead =
                 remoteGeneration == null || remoteOpenAllowed(remoteGeneration)
             val leaseHealthyBeforeRead = hasHealthyActiveLease()
             val freshState = controller.readState(activeLeaseTarget)
-            val lifecycleStillAllowed = lifecycleStillAllowedBeforeRead && openAllowed()
+            val lifecycleStillAllowed = lifecycleStillAllowedBeforeRead && openingAllowed()
             val generationStillAllowed = generationStillAllowedBeforeRead &&
                 (remoteGeneration == null || remoteOpenAllowed(remoteGeneration))
             val leaseStillHealthy = leaseHealthyBeforeRead && hasHealthyActiveLease()
@@ -620,7 +644,7 @@ class MicCoordinator(
             // Do not create even a brief capture window when a guard reports internally
             // inconsistent flags, or when setup consumed the entire monotonic lease. The
             // same check runs again after OPEN to close the concurrent-expiry boundary.
-            val lifecycleAllowedBeforeOpen = openAllowed()
+            val lifecycleAllowedBeforeOpen = openingAllowed()
             val generationAllowedBeforeOpen =
                 remoteGeneration == null || remoteOpenAllowed(remoteGeneration)
             val leaseValidBeforeOpen = hasValidActiveLease()
@@ -661,7 +685,7 @@ class MicCoordinator(
             )
             val attempt = try {
                 leaseSafety.withMutationLock {
-                    val lifecycleAllowedAtDispatch = openAllowed()
+                    val lifecycleAllowedAtDispatch = openingAllowed()
                     val generationAllowedAtDispatch =
                         remoteGeneration == null || remoteOpenAllowed(remoteGeneration)
                     val calibrationAllowedAtDispatch =
@@ -692,7 +716,7 @@ class MicCoordinator(
                         )
                     } else {
                         val candidate = controller.open(frozenTarget, authorization)
-                        val lifecycleAllowedAfterOpen = openAllowed()
+                        val lifecycleAllowedAfterOpen = openingAllowed()
                         val generationAllowedAfterOpen =
                             remoteGeneration == null || remoteOpenAllowed(remoteGeneration)
                         val calibrationAllowedAfterOpen =
@@ -777,7 +801,7 @@ class MicCoordinator(
             val generationStillAllowed =
                 remoteGeneration == null || remoteOpenAllowed(remoteGeneration)
             val deadlineStillValid = hasValidActiveLease()
-            val lifecycleStillAllowed = openAllowed()
+            val lifecycleStillAllowed = openingAllowed()
             val calibrationAtCommit = !requireCalibration || calibrationValid()
             // Reuses the in-lock proof taken after `controller.open` instead of a second Root
             // shell round trip. Nothing between the two points can invalidate the guard without

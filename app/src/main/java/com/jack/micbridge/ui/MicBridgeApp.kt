@@ -34,8 +34,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private enum class BridgeRoute(val title: String, val symbol: BridgeSymbol) {
-    CONTROL("控制", BridgeSymbol.CONTROL), CONNECT("连接", BridgeSymbol.LINK), SETTINGS("设置", BridgeSymbol.SETTINGS),
-    CALIBRATION("声学校准", BridgeSymbol.MIC), DIAGNOSTICS("诊断与记录", BridgeSymbol.INFO), ADVANCED("高级控制", BridgeSymbol.CONTROL);
+    CONTROL("麦克风", BridgeSymbol.CONTROL), CONNECT("连接", BridgeSymbol.LINK), SETTINGS("设置", BridgeSymbol.SETTINGS),
+    CALIBRATION("设备验证", BridgeSymbol.MIC), DIAGNOSTICS("问题与操作记录", BridgeSymbol.INFO), ADVANCED("高级维护", BridgeSymbol.CONTROL);
     val isMain get() = this in MainRoutes
     companion object { val MainRoutes = listOf(CONTROL, CONNECT, SETTINGS) }
 }
@@ -54,7 +54,6 @@ fun MicBridgeApp(resumeGeneration: Int) {
     var settingsRevision by remember { mutableIntStateOf(0) }
     // Drafts are independent of preference refreshes. Saving one setting must not
     // discard another field's unsubmitted input. Human calibration evidence is separate.
-    var packageInput by rememberSaveable { mutableStateOf(settings.targetPackage) }
     var portInput by rememberSaveable { mutableStateOf(settings.port.toString()) }
     var secondsInput by rememberSaveable { mutableStateOf(settings.maxOpenSeconds.toString()) }
     var confirmation by remember { mutableStateOf<Confirmation?>(null) }
@@ -93,15 +92,15 @@ fun MicBridgeApp(resumeGeneration: Int) {
 
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
         if (results.values.all { it }) command(BridgeForegroundService.ACTION_START, "权限已授予，正在启动并确认屏蔽")
-        else notify("权限未完整授予，远程服务不会开放")
+        else notify("权限尚未完整授予，请在需要时从设置重新允许")
         settingsRevision++
     }
     fun start() {
-        val missing = requiredRuntimePermissions(context)
+        val missing = requiredCoreRuntimePermissions(context)
         if (missing.isEmpty()) command(BridgeForegroundService.ACTION_START, "正在启动并确认屏蔽")
         else permissionLauncher.launch(missing.toTypedArray())
     }
-    fun block() = command(BridgeForegroundService.ACTION_BLOCK, "正在执行完整屏蔽，请等待状态读回")
+    fun block() = command(BridgeForegroundService.ACTION_BLOCK, "正在屏蔽系统麦克风，请等待确认")
     fun navigate(destination: BridgeRoute) {
         if (route == BridgeRoute.CALIBRATION && destination != route &&
             (calibration.stage != CalibrationStage.IDLE || calibration.working || dispatchHold || snapshot.autoBlockAtEpochMs != null)
@@ -122,13 +121,13 @@ fun MicBridgeApp(resumeGeneration: Int) {
         if (!calibration.working && calibration.stage == CalibrationStage.IDLE &&
             snapshot.controlReadback && !snapshot.transitioning && snapshot.micAccess == MicAccessState.BLOCKED &&
             snapshot.autoBlockAtEpochMs == null && snapshot.observedAtEpochMs != exitObservation
-        ) { pendingDestination = null; route = destination; notify("已确认完整屏蔽，本轮校准已退出") }
+        ) { pendingDestination = null; route = destination; notify("已确认完整屏蔽，本轮测试已退出") }
     }
     LaunchedEffect(pendingDestination) {
         if (pendingDestination != null) {
             delay(15_000)
             pendingDestination = null
-            notify("尚未确认完整屏蔽，已留在校准页，请重试")
+            notify("尚未确认完整屏蔽，已留在验证页，请重试")
         }
     }
     BackHandler(route != BridgeRoute.CONTROL) { back() }
@@ -137,7 +136,10 @@ fun MicBridgeApp(resumeGeneration: Int) {
         SettingsValues(settings.autoStart, settings.reliableMode, settings.rootBootGuardInstalled, settings.hasPendingAppOpsState, settings.controllerId)
     }
     val token = remember(settingsRevision) { settings.token }
-    val runtimeGranted = remember(settingsRevision, resumeGeneration) { requiredRuntimePermissions(context).isEmpty() }
+    val runtimeGranted = remember(settingsRevision, resumeGeneration, snapshot.serviceRunning) {
+        BridgeForegroundService.hasVisibleNotificationPermission(context)
+    }
+    val remoteGranted = remember(settingsRevision, resumeGeneration) { requiredRuntimePermissions(context).isEmpty() }
     val exactAlarmGranted = remember(settingsRevision, resumeGeneration) { context.getSystemService(AlarmManager::class.java).canScheduleExactAlarms() }
     val records by produceState<List<AuditEntry>?>(null, route, settingsRevision, snapshot.observedAtEpochMs) {
         if (route == BridgeRoute.DIAGNOSTICS) value = withContext(Dispatchers.IO) { audit.recent(20) }
@@ -178,7 +180,19 @@ fun MicBridgeApp(resumeGeneration: Int) {
         Box(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding)) {
             pageState.SaveableStateProvider(route.name) {
                 when (route) {
-                    BridgeRoute.CONTROL -> ControlScreen(snapshot, ::start, ::block, { navigate(BridgeRoute.CONNECT) }, { navigate(BridgeRoute.CALIBRATION) }, { navigate(BridgeRoute.DIAGNOSTICS) })
+                    BridgeRoute.CONTROL -> ControlScreen(
+                        snapshot, runtimeGranted, exactAlarmGranted, dispatchHold,
+                        onStart = ::start, onBlock = ::block,
+                        onRestore = {
+                            // A tap only requests a transition; state remains service-owned.
+                            if (!dispatchHold && nextControlAction(ServiceRuntime.snapshot.value, runtimeGranted, exactAlarmGranted) == ControlAction.RESTORE) {
+                                dispatchHold = true; dispatchSequence++
+                                command(BridgeForegroundService.ACTION_TOGGLE, "正在恢复麦克风，请等待系统确认")
+                            }
+                        },
+                        onConnect = { navigate(BridgeRoute.CONNECT) }, onCalibrate = { navigate(BridgeRoute.CALIBRATION) },
+                        onSettings = { navigate(BridgeRoute.SETTINGS) }, onDiagnose = { navigate(BridgeRoute.DIAGNOSTICS) },
+                    )
                     BridgeRoute.CONNECT -> ConnectionScreen(
                         snapshot, token, portInput, { portInput = it.filter(Char::isDigit).take(5) },
                         onSavePort = {
@@ -186,39 +200,49 @@ fun MicBridgeApp(resumeGeneration: Int) {
                             if (!ServiceRuntime.snapshot.value.serviceRunning && port != null && port in 1024..65535) save("端口已保存") { settings.port = port }
                         },
                         onCopy = { label, value, sensitive ->
-                            runCatching { copyText(context, label, value, sensitive) }.onSuccess { notify(if (sensitive) "令牌已复制" else "请求地址已复制") }.onFailure { notify("复制失败") }
+                            runCatching { copyText(context, label, value, sensitive) }.onSuccess { notify(if (sensitive) "访问密钥已复制" else "请求地址已复制") }.onFailure { notify("复制失败") }
                         },
                         onRotate = { confirmation = Confirmation.ROTATE_TOKEN }, onSettings = { navigate(BridgeRoute.SETTINGS) },
+                        remotePermissionGranted = remoteGranted,
+                        onRequestPermission = { permissionLauncher.launch(requiredRuntimePermissions(context).toTypedArray()) },
                     )
                     BridgeRoute.SETTINGS -> SettingsScreen(
                         snapshot, values, runtimeGranted, exactAlarmGranted,
                         onStart = ::start, onStop = { command(BridgeForegroundService.ACTION_STOP, "正在屏蔽，确认后将停止服务") },
                         onAutoStart = { save("开机启动设置已保存") { settings.autoStart = it } },
                         onReliable = { if (!ServiceRuntime.snapshot.value.serviceRunning) save("后台运行设置已保存") { settings.reliableMode = it } },
-                        onPermissions = { if (runtimeGranted) openSystemSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, true) else permissionLauncher.launch(requiredRuntimePermissions(context).toTypedArray()) },
+                        onPermissions = {
+                            val missing = requiredCoreRuntimePermissions(context)
+                            if (missing.isNotEmpty()) permissionLauncher.launch(missing.toTypedArray())
+                            else runCatching {
+                                context.startActivity(Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                                    .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                                    .putExtra(Settings.EXTRA_CHANNEL_ID, BridgeForegroundService.CHANNEL_ID))
+                            }.onFailure { openSystemSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, true) }
+                        },
                         onExactAlarm = { if (exactAlarmGranted) notify("精确闹钟权限已允许") else openSystemSettings(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, true) },
                         onBattery = { openSystemSettings(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS) },
                         onAppSettings = { openSystemSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, true) },
-                        onInstallGuard = { command(BridgeForegroundService.ACTION_INSTALL_GUARD, "正在确认屏蔽并配置开机保护") },
-                        onRemoveGuard = { confirmation = Confirmation.REMOVE_GUARD },
                         onCalibrate = { navigate(BridgeRoute.CALIBRATION) }, onDiagnostics = { navigate(BridgeRoute.DIAGNOSTICS) }, onAdvanced = { navigate(BridgeRoute.ADVANCED) },
                     )
                     BridgeRoute.ADVANCED -> AdvancedScreen(
-                        snapshot, values, packageInput, secondsInput,
-                        onController = { if (editableController()) save("控制方案已保存，请重新校准") { settings.controllerId = it; settings.clearCalibration() } },
-                        onPackageChange = { packageInput = it },
-                        onSavePackage = { if (editableController() && PackagePattern.matches(packageInput)) save("目标应用已保存，请重新校准") { settings.targetPackage = packageInput; settings.originalAppOpsMode = null; settings.clearCalibration() } },
+                        snapshot, values, secondsInput,
+                        onController = { if (editableController()) save("控制方案已保存，请重新验证") { settings.controllerId = it; settings.clearCalibration() } },
                         onSecondsChange = { secondsInput = it.filter(Char::isDigit).take(2) },
                         onSaveSeconds = {
                             val seconds = secondsInput.toIntOrNull()
-                            if (!ServiceRuntime.snapshot.value.serviceRunning && seconds != null && seconds in SettingsRepository.MIN_OPEN_SECONDS..SettingsRepository.MAX_OPEN_SECONDS) save("校准时限已保存") { settings.maxOpenSeconds = seconds }
+                            if (!ServiceRuntime.snapshot.value.serviceRunning && seconds != null && seconds in SettingsRepository.MIN_OPEN_SECONDS..SettingsRepository.MAX_OPEN_SECONDS) save("测试时限已保存") { settings.maxOpenSeconds = seconds }
                         }, onMaintenance = { navigate(BridgeRoute.SETTINGS) },
+                        onInstallGuard = { command(BridgeForegroundService.ACTION_INSTALL_GUARD, "正在确认屏蔽并配置开机保护") },
+                        onRemoveGuard = { confirmation = Confirmation.REMOVE_GUARD },
                     )
                     BridgeRoute.CALIBRATION -> CalibrationScreen(
-                        snapshot, calibration, settings.targetPackage, dispatchHold, pendingDestination != null,
+                        snapshot, calibration, dispatchHold, pendingDestination != null,
+                        preparationReady = runtimeGranted && exactAlarmGranted && snapshot.batteryOptimizationExempt,
+                        onSettings = { navigate(BridgeRoute.SETTINGS) },
                         onCommand = { action ->
                             dispatchHold = true; dispatchSequence++
-                            command(action, if (action == BridgeForegroundService.ACTION_COMPLETE_CALIBRATION) "正在最终确认屏蔽并提交校准" else "正在执行校准步骤，请等待实际读回")
+                            command(action, if (action == BridgeForegroundService.ACTION_COMPLETE_CALIBRATION) "正在最终确认屏蔽并保存验证结果" else "正在执行测试步骤，请等待系统确认")
                         }, onStart = ::start, onBlock = ::block,
                     )
                     BridgeRoute.DIAGNOSTICS -> DiagnosticsScreen(snapshot, records) { command(BridgeForegroundService.ACTION_START, "正在先屏蔽并重新检查网络与状态"); settingsRevision++ }
@@ -231,22 +255,26 @@ fun MicBridgeApp(resumeGeneration: Int) {
         AlertDialog(
             onDismissRequest = { confirmation = null },
             icon = { BridgeIcon(if (kind == Confirmation.REMOVE_GUARD) BridgeSymbol.SHIELD else BridgeSymbol.LINK) },
-            title = { Text(if (kind == Confirmation.REMOVE_GUARD) "安全移除开机保护" else "更换访问令牌") },
-            text = { Text(if (kind == Confirmation.REMOVE_GUARD) "将先完整屏蔽麦克风、清理旧元数据，再移除保护并停止服务。当前 AppOps 策略会保留。只有屏蔽得到确认后才会继续。" else "旧令牌将立即失效。更换后，需要同步更新 iPhone 快捷指令。") },
+            title = { Text(if (kind == Confirmation.REMOVE_GUARD) "安全移除开机保护" else "更换访问密钥") },
+            text = { Text(if (kind == Confirmation.REMOVE_GUARD) "确认麦克风已屏蔽后，将移除开机保护并停止服务。应用已有的麦克风权限不会改变。" else "旧密钥将立即失效。更换后，需要同步更新 iPhone 快捷指令。") },
             confirmButton = {
                 TextButton(onClick = {
                     if (kind == Confirmation.REMOVE_GUARD) command(BridgeForegroundService.ACTION_REMOVE_GUARD, "正在完整屏蔽并执行安全移除")
-                    else if (!ServiceRuntime.snapshot.value.serviceRunning) save("令牌已更换，请更新快捷指令") { settings.rotateToken() }
+                    else if (!ServiceRuntime.snapshot.value.serviceRunning) save("密钥已更换，请更新快捷指令") { settings.rotateToken() }
                     confirmation = null
-                }, enabled = kind != Confirmation.ROTATE_TOKEN || !snapshot.serviceRunning) { Text(if (kind == Confirmation.REMOVE_GUARD) "屏蔽并移除" else "更换令牌") }
+                }, enabled = kind != Confirmation.ROTATE_TOKEN || !snapshot.serviceRunning) { Text(if (kind == Confirmation.REMOVE_GUARD) "屏蔽并移除" else "更换密钥") }
             },
             dismissButton = { TextButton(onClick = { confirmation = null }) { Text("取消") } },
         )
     }
 }
 
-private fun requiredRuntimePermissions(context: Context): List<String> = buildList {
+private fun requiredCoreRuntimePermissions(context: Context): List<String> = buildList {
     if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) add(Manifest.permission.POST_NOTIFICATIONS)
+}
+
+private fun requiredRuntimePermissions(context: Context): List<String> = buildList {
+    addAll(requiredCoreRuntimePermissions(context))
     if (Build.VERSION.SDK_INT >= 37 && ContextCompat.checkSelfPermission(context, BridgeForegroundService.PERMISSION_LOCAL_NETWORK) != PackageManager.PERMISSION_GRANTED) add(BridgeForegroundService.PERMISSION_LOCAL_NETWORK)
 }
 

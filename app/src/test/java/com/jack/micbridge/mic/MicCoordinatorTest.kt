@@ -88,6 +88,103 @@ class MicCoordinatorTest {
     }
 
     @Test
+    fun `local toggle works without a network listener and uses a persistent safety guard`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            persistentRemoteOpen = true,
+            controllerId = "audio_manager",
+        )
+        fixture.remoteOpenAllowed = false
+        fixture.lease.rootWatchdogArmed = true
+
+        val opened = fixture.coordinator.localToggle()
+        val blocked = fixture.coordinator.localToggle()
+
+        assertTrue(opened.ok)
+        assertEquals(MicAccessState.OPEN, opened.micAccess)
+        assertNull(opened.autoBlockAtEpochMs)
+        assertEquals(1, fixture.lease.persistentArmCount)
+        assertEquals(0, fixture.lease.armCount)
+        assertTrue(blocked.ok)
+        assertEquals(MicAccessState.BLOCKED, blocked.micAccess)
+        assertEquals(1, fixture.lease.cancelCount)
+    }
+
+    @Test
+    fun `local toggle requires current calibration and lifecycle safety`() = runTest {
+        val uncalibrated = Fixture(initialState = MicAccessState.BLOCKED, calibrated = false)
+        val calibrationResult = uncalibrated.coordinator.localToggle()
+        assertFalse(calibrationResult.ok)
+        assertEquals("ACOUSTIC_CALIBRATION_REQUIRED", calibrationResult.errorCode)
+        assertEquals(0, uncalibrated.controller.openCount)
+        assertEquals(MicAccessState.BLOCKED, calibrationResult.micAccess)
+
+        val unsafe = Fixture(initialState = MicAccessState.BLOCKED)
+        unsafe.openAllowed = false
+        val lifecycleResult = unsafe.coordinator.localToggle()
+        assertFalse(lifecycleResult.ok)
+        assertEquals("OPEN_LIFECYCLE_DISABLED", lifecycleResult.errorCode)
+        assertEquals(0, unsafe.controller.openCount)
+    }
+
+    @Test
+    fun `local toggle from unknown only blocks and never guesses open`() = runTest {
+        val fixture = Fixture(initialState = MicAccessState.UNKNOWN)
+        val result = fixture.coordinator.localToggle()
+        assertEquals(MicAccessState.BLOCKED, result.micAccess)
+        assertEquals(0, fixture.controller.openCount)
+    }
+
+    @Test
+    fun `local toggle refuses persistent open when root guard is unhealthy`() = runTest {
+        val fixture = Fixture(
+            initialState = MicAccessState.BLOCKED,
+            persistentRemoteOpen = true,
+            controllerId = "audio_manager",
+        )
+        fixture.lease.rootWatchdogArmed = false
+        val result = fixture.coordinator.localToggle()
+        assertFalse(result.ok)
+        assertEquals(MicAccessState.BLOCKED, result.micAccess)
+        assertEquals(0, fixture.controller.openCount)
+    }
+
+    @Test
+    fun `calibration boundary arriving during local lease arm prevents normal open`() = runTest {
+        val fixture = Fixture(initialState = MicAccessState.BLOCKED)
+        fixture.lease.onArm = { fixture.normalOpenAllowed = false }
+        val result = fixture.coordinator.localToggle()
+        assertFalse(result.ok)
+        assertEquals("OPEN_LIFECYCLE_DISABLED", result.errorCode)
+        assertEquals(MicAccessState.BLOCKED, result.micAccess)
+        assertEquals(0, fixture.controller.openCount)
+        assertEquals(1, fixture.lease.cancelCount)
+    }
+
+    @Test
+    fun `calibration boundary arriving during local mutation rolls back normal open`() = runTest {
+        val fixture = Fixture(initialState = MicAccessState.BLOCKED)
+        fixture.controller.onOpen = { fixture.normalOpenAllowed = false }
+        val result = fixture.coordinator.localToggle()
+        assertFalse(result.ok)
+        assertEquals(MicAccessState.BLOCKED, result.micAccess)
+        assertEquals(1, fixture.controller.openCount)
+        assertEquals(1, fixture.lease.cancelCount)
+    }
+
+    @Test
+    fun `normal open boundary does not block the guarded temporary calibration path`() = runTest {
+        val fixture = Fixture(initialState = MicAccessState.BLOCKED, calibrated = false)
+        fixture.normalOpenAllowed = false
+        fixture.lease.rootWatchdogArmed = true
+        val result = fixture.coordinator.calibrationOpen()
+        assertTrue(result.commandSucceeded)
+        assertEquals(MicAccessState.OPEN, result.micAccess)
+        assertEquals(1, fixture.lease.armCount)
+        assertEquals(0, fixture.lease.persistentArmCount)
+    }
+
+    @Test
     fun `same request id never toggles twice and reports fresh state`() = runTest {
         val fixture = Fixture(initialState = MicAccessState.BLOCKED)
 
@@ -543,7 +640,7 @@ class MicCoordinatorTest {
             val isolated = fixture.coordinator.calibrationIsolateRootFailsafe(
                 rootGate = rootGate,
                 audioGate = audioGate,
-                appOpsVeto = ReadOnlyOpenVeto { MicAccessState.OPEN },
+                targetUserIsForeground = { true },
                 immediateRootBlock = {
                     immediateBlockCalled = true
                     true
@@ -562,7 +659,7 @@ class MicCoordinatorTest {
             val confirmed = fixture.coordinator.confirmRootIsolationAndBlock(
                 rootGate,
                 audioGate,
-                ReadOnlyOpenVeto { MicAccessState.OPEN },
+                { true },
             )
             assertTrue(confirmed.controlReadback)
             assertEquals(MicAccessState.BLOCKED, fixture.controller.state)
@@ -582,7 +679,7 @@ class MicCoordinatorTest {
         val isolated = fixture.coordinator.calibrationIsolateRootFailsafe(
             rootGate = FakeController(MicAccessState.OPEN, "root_sensor_privacy"),
             audioGate = FakeController(MicAccessState.OPEN, "audio_manager"),
-            appOpsVeto = ReadOnlyOpenVeto { MicAccessState.OPEN },
+            targetUserIsForeground = { true },
             immediateRootBlock = { false },
         )
 
@@ -606,7 +703,7 @@ class MicCoordinatorTest {
         val isolated = fixture.coordinator.calibrationIsolateRootFailsafe(
             rootGate = coupledGate,
             audioGate = coupledGate,
-            appOpsVeto = ReadOnlyOpenVeto { MicAccessState.OPEN },
+            targetUserIsForeground = { true },
         )
 
         assertFalse(isolated.controlReadback)
@@ -616,7 +713,7 @@ class MicCoordinatorTest {
     }
 
     @Test
-    fun `AppOps denial cannot masquerade as successful root acoustic isolation`() = runTest {
+    fun `foreground user change cannot pass root acoustic isolation`() = runTest {
         val fixture = Fixture(
             initialState = MicAccessState.BLOCKED,
             calibrated = false,
@@ -630,17 +727,17 @@ class MicCoordinatorTest {
         val isolated = fixture.coordinator.calibrationIsolateRootFailsafe(
             rootGate,
             audioGate,
-            ReadOnlyOpenVeto { MicAccessState.BLOCKED },
+            { false },
         )
 
         assertFalse(isolated.controlReadback)
-        assertEquals("CALIBRATION_APPOPS_NOT_OPEN", isolated.errorCode)
+        assertEquals("CALIBRATION_USER_CHANGED", isolated.errorCode)
         assertEquals(MicAccessState.BLOCKED, fixture.controller.state)
         assertEquals(1, fixture.lease.cancelCount)
     }
 
     @Test
-    fun `confirmation rechecks AppOps and invalidates a changed split state`() = runTest {
+    fun `confirmation rechecks foreground user and invalidates a changed split state`() = runTest {
         val fixture = Fixture(
             initialState = MicAccessState.BLOCKED,
             calibrated = false,
@@ -653,13 +750,13 @@ class MicCoordinatorTest {
         fixture.coordinator.calibrationIsolateRootFailsafe(
             rootGate,
             audioGate,
-            ReadOnlyOpenVeto { MicAccessState.OPEN },
+            { true },
         )
 
         val confirmed = fixture.coordinator.confirmRootIsolationAndBlock(
             rootGate,
             audioGate,
-            ReadOnlyOpenVeto { MicAccessState.BLOCKED },
+            { false },
         )
 
         assertFalse(confirmed.controlReadback)
@@ -686,7 +783,7 @@ class MicCoordinatorTest {
         val isolated = fixture.coordinator.calibrationIsolateRootFailsafe(
             rootGate,
             audioGate,
-            ReadOnlyOpenVeto { MicAccessState.OPEN },
+            { true },
         )
 
         assertFalse(isolated.controlReadback)
@@ -834,7 +931,7 @@ class MicCoordinatorTest {
         assertEquals(MicAccessState.BLOCKED, fixture.controller.state)
         assertEquals(MicAccessState.BLOCKED, fixture.snapshots.last().micAccess)
         assertTrue(
-            fixture.snapshots.last().lastError.orEmpty().contains("声学校准"),
+            fixture.snapshots.last().lastError.orEmpty().contains("收音验证"),
         )
     }
 
@@ -1065,6 +1162,7 @@ class MicCoordinatorTest {
         var operationNanos = 0L
         var remoteOpenAllowed = true
         var openAllowed = true
+        var normalOpenAllowed = true
         var calibratedState = calibrated
         /** Ordered record of the controller and lease side effects of one operation. */
         val events = mutableListOf<String>()
@@ -1081,6 +1179,7 @@ class MicCoordinatorTest {
             calibrationValid = { calibratedState },
             persistentRemoteOpen = { persistentRemoteOpen },
             openAllowed = { openAllowed },
+            normalOpenAllowed = { normalOpenAllowed },
             remoteOpenAllowed = { _: Long -> remoteOpenAllowed },
             nowEpochMs = { time },
             elapsedRealtimeMs = { time },
@@ -1106,7 +1205,7 @@ class MicCoordinatorTest {
         var openCount = 0
         var beforeOpenMutation: suspend () -> Unit = {}
         var onOpen: suspend () -> Unit = {}
-        val defaultTarget = SafetyTarget(id, "com.openai.chatgpt", 0)
+        val defaultTarget = SafetyTarget(id, "android-global-microphone", 0)
         val blockTargets = mutableListOf<SafetyTarget?>()
         val openTargets = mutableListOf<SafetyTarget>()
 

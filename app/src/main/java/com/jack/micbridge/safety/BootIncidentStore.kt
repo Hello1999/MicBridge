@@ -61,6 +61,7 @@ class BootIncidentStore(context: Context) {
                     .setCategory(NotificationCompat.CATEGORY_ERROR)
                     .setPriority(NotificationCompat.PRIORITY_HIGH)
                     .setOngoing(true)
+                    .setOnlyAlertOnce(true)
                     .setContentIntent(contentIntent)
                     .build(),
             )

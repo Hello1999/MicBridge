@@ -1,5 +1,7 @@
 # MicBridge 设备测试矩阵
 
+> 历史记录：本文对应 2026-09-04 前后使用应用定向校准的旧实现。下文“当前/最终/本轮”和 PASS 均限于当时版本，不是 2026-09-22 系统麦克风改动的验收。ChatGPT/AppOps 项保留作历史证据；新版范围与待验清单见 [系统麦克风审查](SYSTEM_MIC_REVIEW_ZH.md)。
+
 > 当前结论：最终源码构建、JVM 测试、签名/权限检查、Motorola 真机部署、两次 Root boot guard 重启检查、Motorola OEM 自然开机启动，以及 iPhone 快捷指令静态结构/iCloud 同步在下述限定范围内为 `PASS`；双机 P0 与端到端验收仍为 `NOT_RUN — ACOUSTIC_AND_ACTION_BUTTON_TESTS_PENDING`。
 >
 > API 37 / Android 17 Pixel_10_Pro AVD 的 13/13 仪器测试、安装、冷启动和无 Root 时 fail-closed 结果来自较早源码快照，未对当前最终源码重新运行，不能作为最终 APK 的模拟器验证。ChatGPT Live 声学、物理锁屏/熄屏与 Doze、Action Button 实际运行、1/2/3 次触感和故障注入继续保持 `NOT_RUN`。

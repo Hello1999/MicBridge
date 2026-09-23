@@ -27,7 +27,7 @@ internal class CalibrationSession(private val onStageChanged: (CalibrationStage)
 
     /**
      * Checks the environment again after OPEN. A mismatch invalidates the entire round instead
-     * of allowing later steps to combine evidence from different app/controller/system builds.
+     * of allowing later steps to combine evidence from different controller/system builds.
      */
     fun observeOpen(
         currentIdentity: AcousticCalibrationIdentity?,
@@ -72,7 +72,7 @@ internal class CalibrationSession(private val onStageChanged: (CalibrationStage)
 
     /**
      * Returns the original frozen identity to persist. It never returns the newly-read identity,
-     * which prevents a target update at submission time from being recorded as if it were tested.
+     * which prevents a system update at submission time from being recorded as if it were tested.
      */
     fun identityForCommit(
         currentIdentity: AcousticCalibrationIdentity?,
@@ -84,7 +84,7 @@ internal class CalibrationSession(private val onStageChanged: (CalibrationStage)
             identity != null &&
             identity == currentIdentity
         // Submission is one-shot even when the subsequent durable write fails. Reusing proof
-        // after a failed commit could bridge an unobserved permission/package transition.
+        // after a failed commit could bridge an unobserved system/controller transition.
         reset()
         return identity.takeIf { valid }
     }
