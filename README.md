@@ -89,7 +89,6 @@ app/src/main/java/com/jack/micbridge/
   service/PttService.kt   前台服务：按键 → 麦克风状态
   ui/PttScreen.kt         单页界面
 firmware/esp32c3_ptt/     XIAO ESP32C3 固件
-legacy/                   旧版（iPhone 快捷指令 / HTTP / 校准方案），仅供参考，不参与构建
 ```
 
 ## 从旧版升级
