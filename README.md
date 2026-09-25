@@ -89,14 +89,30 @@ app/src/main/java/com/jack/micbridge/
   service/PttService.kt   前台服务：按键 → 麦克风状态
   ui/PttScreen.kt         单页界面
 firmware/esp32c3_ptt/     XIAO ESP32C3 固件
+extras/chatgpt-phone-mic/ LSPosed 模块：连着蓝牙耳机时 ChatGPT 用手机麦克风
 ```
 
+## 连着蓝牙耳机时 ChatGPT 录不到声音
+
+蓝牙耳机只要支持通话协议（HFP），系统就把它当成带麦克风的耳机。ChatGPT Live 打开时会自己调用 `startBluetoothSco()`。SCO 链路一建立，系统就把所有通话录音（`VOICE_COMMUNICATION`）切到耳机的 SCO 麦克风，连 MicBridge 的收音测试也会被带过去。耳机麦克风录不到声音，按住按钮也就没用了。
+
+实测无效的做法：
+
+- 系统级“首选收音设备”（Root，`setPreferredDevicesForCapturePreset`）：通话模式下被忽略。
+- 只给 ChatGPT 的 `AudioRecord` 指定手机麦克风（旧版 capturehook 0.1.0）：SCO 一建立就被系统覆盖，日志会出现 `route_changed ... routed=type:7`。
+- 关掉耳机的“通话音频”：收音正常，但 ChatGPT 处于通话模式，声音改从手机听筒或扬声器播放。
+
+有效的做法是用 LSPosed 模块 [`extras/chatgpt-phone-mic`](extras/chatgpt-phone-mic/)，只作用于 ChatGPT。它会拦截 SCO、通话模式、通话设备和免提这几类调用，让 ChatGPT 从手机麦克风收音，声音通过 A2DP 从耳机播放。耳机的“通话音频”保持开启，普通电话不受影响。
+
+已知情况：ChatGPT 会先尝试两次 SCO，每次约 4 秒，都失败后才放弃。所以 Live 刚打开时，声音可能要晚几秒才出来。
+
+## 从旧版升级
 ## 从旧版升级
 
 旧版可能留下 Root 开机脚本 `/data/adb/service.d/micbridge-failsafe.sh` 和 watcher 进程，开机会重新打开麦克风隐私屏蔽。安装新版前：
 
 1. 在旧版 App 的高级维护里点“移除保护并停止服务”。如果旧版已打不开，就在 Root 下删除该脚本并重启。
 2. 卸载旧版，或执行 `adb shell pm clear com.jack.micbridge` 后再安装新版。
-3. 在 LSPosed 里停用 `com.jack.micbridge.capturehook`（旧的 ChatGPT 录音路由模块），否则会干扰测试结果。
+3. LSPosed 模块 `com.jack.micbridge.capturehook` 请升级到 0.3.0 或更高版本并保持启用，见上一节。0.1.0 在 SCO 建立后会失效。
 
 源码按 [Apache License 2.0](LICENSE) 发布。
